@@ -128,6 +128,7 @@ class ContrastiveInputTransform(Transform):
         negative_field: str = "negative",
         num_negative_samples_per_anchor: int = 1,
         add_special_tokens: bool = True,
+        max_sample_length: int | None = None,
     ):
         self.tokenizer = tokenizer
         self.anchor_field = anchor_field
@@ -135,6 +136,7 @@ class ContrastiveInputTransform(Transform):
         self.negative_field = negative_field
         self.num_negative_samples_per_anchor = num_negative_samples_per_anchor
         self.add_special_tokens = add_special_tokens
+        self.max_sample_length = max_sample_length
 
         assert num_negative_samples_per_anchor > 0, (
             "num_negative_samples_per_anchor must be greater than 0"
@@ -199,6 +201,11 @@ class ContrastiveInputTransform(Transform):
             anchor_triplet_types + positive_triplet_types + negative_triplet_types
         )
 
+        # Apply truncation if max_sample_length is specified
+        if self.max_sample_length is not None:
+            all_tokens = all_tokens[: self.max_sample_length]
+            triplet_type = triplet_type[: self.max_sample_length]
+
         result = {
             "input_ids": all_tokens,
             "triplet_type": np.array(triplet_type, dtype=np.int32),
@@ -231,6 +238,7 @@ def create_dataset_pipeline(
     strategy: str = "greedy",
     resume_state: ResumeState | None = None,
     add_special_tokens: bool = True,
+    max_sample_length: int | None = None,
 ) -> Pipeline:
     """Create a Pipeline for triplet data with triplet_type preserved.
 
@@ -251,6 +259,9 @@ def create_dataset_pipeline(
       strategy: Packing strategy. Valid values: "greedy", "pool", "first_fit"
       resume_state: Optional ResumeState to resume from a checkpoint
       add_special_tokens: Whether to add trainable special tokens during tokenization.
+      max_sample_length: Maximum length for each individual sample (anchor, positive, or negative).
+                  If specified, each text segment will be truncated to this length.
+                  If None, no truncation is applied (default: None).
 
     Returns:
       Pipeline object ready to be chained with stages
@@ -304,6 +315,7 @@ def create_dataset_pipeline(
     # Get sources and apply transform
     data = pipeline.get_data()
     transformed_sources = {}
+    resumable_wrappers = {}  # Store references to resumable wrappers
 
     if resume_state is None:
         resume_state = ResumeState(
@@ -324,13 +336,15 @@ def create_dataset_pipeline(
 
     for name, source in data.items():
         # Apply resume state to source if provided
-        source = _ResumableSourceWrapper(source, resume_state)
+        resumable_wrapper = _ResumableSourceWrapper(source, resume_state)
+        resumable_wrappers[name] = resumable_wrapper
 
         transformed_source = TransformedShardedSource(
-            source=source,
+            source=resumable_wrapper,
             transform=ContrastiveInputTransform(
                 tokenizer=tokenizer,
                 add_special_tokens=add_special_tokens,
+                max_sample_length=max_sample_length,
             ),
         )
         transformed_sources[name] = transformed_source
@@ -365,6 +379,29 @@ def create_dataset_pipeline(
         return pipeline_copy
 
     pipeline.pack = pack_with_triplet_type
+
+    # Add method to get current resume state
+    def get_current_resume_state(dataset_name: str | None = None) -> ResumeState | None:
+        """Get current resume state for a dataset.
+
+        Args:
+            dataset_name: Name of the dataset. If None, returns the first dataset's state.
+
+        Returns:
+            Current ResumeState or None if dataset not found.
+        """
+        if dataset_name is None:
+            # Get the first dataset
+            if not resumable_wrappers:
+                return None
+            dataset_name = list(resumable_wrappers.keys())[0]
+
+        if dataset_name in resumable_wrappers:
+            return resumable_wrappers[dataset_name].get_current_state()
+        return None
+
+    pipeline.get_current_resume_state = get_current_resume_state
+
     return pipeline
 
 
@@ -375,6 +412,7 @@ def create_dataset_source(
     batch_size: int = 8,
     seq_length: int = 32768,
     max_samples: int | None = 128,
+    max_sample_length: int | None = None,
     eos_token_id: int | None = None,
     pad_token_id: int = 0,
     shuffle: bool = True,
@@ -398,6 +436,9 @@ def create_dataset_source(
       batch_size: Batch size for loading data
       seq_length: Maximum sequence length (default: 32768)
       max_samples: Maximum number of samples per packed sequence
+      max_sample_length: Maximum length for each individual sample (anchor, positive, or negative).
+                  If specified, each text segment will be truncated to this length.
+                  If None, no truncation is applied (default: None).
       eos_token_id: EOS token ID (default: tokenizer.eos_token_id)
       pad_token_id: Padding token ID
       shuffle: Whether to shuffle packed sequences
@@ -445,6 +486,7 @@ def create_dataset_source(
             strategy=strategy,
             resume_state=resume_state,
             add_special_tokens=add_special_tokens,
+            max_sample_length=max_sample_length,
         )
 
     # Get ShardedDataSource from pipeline after pack and load stages
@@ -469,15 +511,29 @@ def create_dataset_source(
             f"Pipeline did not return ShardedDataSource. Got: {type(source)}"
         )
 
+    # Add method to get current resume state from pipeline if available
+    if hasattr(pipeline, "get_current_resume_state"):
+
+        def get_current_resume_state():
+            return pipeline.get_current_resume_state()
+
+        source.get_current_resume_state = get_current_resume_state
+
     return source
 
 
 class _ResumableSourceWrapper(ShardedDataSource[dict]):
-    """Internal wrapper to apply resume state to source."""
+    """Internal wrapper to apply resume state to source and track progress."""
 
     def __init__(self, source: ShardedDataSource[dict], resume_state: ResumeState):
         self._source = source
-        self._resume_state = resume_state
+        self._initial_resume_state = resume_state
+        # Current reading position
+        self._current_shard_index = resume_state.shard_index
+        self._current_row_index = resume_state.row_index
+        # For tracking during iteration
+        self._current_shard_name = None
+        self._rows_yielded_in_current_shard = 0
 
     @property
     def shard_names(self) -> Sequence[str]:
@@ -489,17 +545,45 @@ class _ResumableSourceWrapper(ShardedDataSource[dict]):
     def open_shard(self, shard_name: str) -> Iterator[dict]:
         shard_idx = self._source.shard_names.index(shard_name)
 
-        if shard_idx < self._resume_state.shard_index:
+        if shard_idx < self._initial_resume_state.shard_index:
+            # Skip shards before the resume point
             return
-        elif shard_idx == self._resume_state.shard_index:
-            yield from self._source.open_shard_at_row(
-                shard_name, self._resume_state.row_index
-            )
+        elif shard_idx == self._initial_resume_state.shard_index:
+            # Start from the resume row in this shard
+            start_row = self._initial_resume_state.row_index
         else:
-            yield from self._source.open_shard(shard_name)
+            # Start from beginning of this shard
+            start_row = 0
+
+        # Update current position
+        self._current_shard_index = shard_idx
+        self._current_shard_name = shard_name
+        self._rows_yielded_in_current_shard = 0
+
+        # Yield items with position tracking
+        row_counter = start_row
+        for item in self._source.open_shard_at_row(shard_name, start_row):
+            self._current_row_index = row_counter
+            self._rows_yielded_in_current_shard += 1
+            row_counter += 1
+            yield item
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
-        return self._source.open_shard_at_row(shard_name, row)
+        shard_idx = self._source.shard_names.index(shard_name)
+
+        # Update current position
+        self._current_shard_index = shard_idx
+        self._current_shard_name = shard_name
+        self._current_row_index = row
+        self._rows_yielded_in_current_shard = 0
+
+        # Yield items with position tracking
+        row_counter = row
+        for item in self._source.open_shard_at_row(shard_name, row):
+            self._current_row_index = row_counter
+            self._rows_yielded_in_current_shard += 1
+            row_counter += 1
+            yield item
 
     def iter_shards(
         self,
@@ -507,11 +591,47 @@ class _ResumableSourceWrapper(ShardedDataSource[dict]):
         start_shard: int = 0,
         start_row: int = 0,
     ) -> Iterator[dict]:
-        return self._source.iter_shards(
+        # Use resume state as the starting point, but allow overriding if explicitly requested
+        if start_shard == 0 and start_row == 0:
+            # Using default values, so use resume state
+            final_start_shard = self._initial_resume_state.shard_index
+            final_start_row = self._initial_resume_state.row_index
+        else:
+            # Caller explicitly requested a different starting point
+            final_start_shard = start_shard
+            final_start_row = start_row
+
+        # Reset tracking
+        self._current_shard_index = final_start_shard
+        self._current_row_index = final_start_row
+        self._current_shard_name = None
+        self._rows_yielded_in_current_shard = 0
+
+        # We need to track which shard we're in during iteration
+        # This is complex with iter_shards, so we'll provide approximate tracking
+        current_global_row = final_start_row
+
+        for item in self._source.iter_shards(
             shard_indices=shard_indices,
-            start_shard=self._resume_state.shard_index,
-            start_row=self._resume_state.row_index,
+            start_shard=final_start_shard,
+            start_row=final_start_row,
+        ):
+            # Approximate tracking: increment row count
+            self._current_row_index = current_global_row
+            current_global_row += 1
+            yield item
+
+    def get_current_state(self) -> ResumeState:
+        """Get the current resume state based on reading progress."""
+        return update_resume_state(
+            self._initial_resume_state,
+            shard_index=self._current_shard_index,
+            row_index=self._current_row_index,
         )
+
+    def get_initial_state(self) -> ResumeState:
+        """Get the initial resume state that was passed to the wrapper."""
+        return self._initial_resume_state
 
     def __len__(self) -> int:
         return len(self._source)

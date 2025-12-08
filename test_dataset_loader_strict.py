@@ -493,7 +493,10 @@ def test_max_samples():
                         for i in range(batch_size):
                             seq_segment_ids = segment_ids[i]
                             seq_info = extract_sample_info_from_segment_ids(
-                                seq_segment_ids
+                                seq_segment_ids,
+                                attention_mask[i]
+                                if attention_mask is not None
+                                else None,
                             )
                             max_samples_per_sequence = max(
                                 max_samples_per_sequence, seq_info.num_samples
@@ -505,6 +508,7 @@ def test_max_samples():
                                 max_samples is not None
                                 and seq_info.num_samples > max_samples
                             ):
+                                breakpoint()
                                 print(
                                     f"  ✗ 错误: batch {batch_count} 中的序列 {i} 包含 {seq_info.num_samples} 个样本，超过max_samples={max_samples}"
                                 )

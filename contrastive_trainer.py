@@ -398,6 +398,7 @@ class ContrastiveTrainer(Trainer):
       ...     tokenizer=tokenizer,
       ...     seq_length=32768,
       ...     max_samples=64,
+      ...     max_sample_length=512,  # 可选：限制每个样本的最大长度
       ... )
       >>>
       >>> # Create trainer
@@ -731,14 +732,32 @@ class ContrastiveTrainer(Trainer):
         if dataset is None:
             return None
 
-        # Recursively search for ResumeState in the wrapper chain
+        # First, try to use get_current_resume_state() method if available
+        # This is the preferred method for ShardedDataSource from create_dataset_source
+        if hasattr(dataset, "get_current_resume_state"):
+            try:
+                resume_state = dataset.get_current_resume_state()
+                if resume_state is not None:
+                    # Update step and epoch, keep shard_index and row_index
+                    return ResumeState(
+                        shard_index=resume_state.shard_index,
+                        row_index=resume_state.row_index,
+                        step=current_step,
+                        epoch=current_epoch,
+                        dataset_states=resume_state.dataset_states,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to call get_current_resume_state(): {e}")
+
+        # Fallback: recursively search for ResumeState in the wrapper chain
         resume_state = self._recursive_find_resume_state(dataset)
         if resume_state is None:
             return None
 
         # Update step and epoch, keep shard_index and row_index
-        # Note: shard_index and row_index represent the starting position
-        # when resuming, not the current position during training
+        # Note: shard_index and row_index represent the current reading position
+        # when saving checkpoint, which should be used as the starting position
+        # when resuming training
         return ResumeState(
             shard_index=resume_state.shard_index,
             row_index=resume_state.row_index,
@@ -751,10 +770,13 @@ class ContrastiveTrainer(Trainer):
         """Recursively search for ResumeState in dataset wrapper chain.
 
         This method handles multiple layers of wrapping:
-        1. Direct _resume_state attribute
-        2. _source attribute (for wrapper classes)
-        3. source attribute (for TransformedShardedSource)
-        4. dataset attribute (for other wrapper types)
+        1. get_current_state() method (for _ResumableSourceWrapper)
+        2. get_current_resume_state() method (for ShardedDataSource from pipeline)
+        3. Direct _resume_state attribute
+        4. _initial_resume_state attribute (for _ResumableSourceWrapper)
+        5. _source attribute (for wrapper classes)
+        6. source attribute (for TransformedShardedSource)
+        7. dataset attribute (for other wrapper types)
 
         Args:
             dataset: Dataset object to search
@@ -762,7 +784,25 @@ class ContrastiveTrainer(Trainer):
         Returns:
             ResumeState if found, None otherwise
         """
-        # Base case: check direct attribute
+        # Check for get_current_state() method (for _ResumableSourceWrapper)
+        if hasattr(dataset, "get_current_state"):
+            try:
+                return dataset.get_current_state()
+            except Exception:
+                pass
+
+        # Check for get_current_resume_state() method
+        if hasattr(dataset, "get_current_resume_state"):
+            try:
+                return dataset.get_current_resume_state()
+            except Exception:
+                pass
+
+        # Check for _initial_resume_state attribute (for _ResumableSourceWrapper)
+        if hasattr(dataset, "_initial_resume_state"):
+            return dataset._initial_resume_state
+
+        # Base case: check direct _resume_state attribute
         if hasattr(dataset, "_resume_state"):
             return dataset._resume_state
 
@@ -787,6 +827,23 @@ class ContrastiveTrainer(Trainer):
         # Check if this is already a _ResumableSourceWrapper
         if isinstance(dataset, wrapper_class):
             # Update existing wrapper's resume state
+            # _ResumableSourceWrapper uses _initial_resume_state and tracks current position
+            dataset._initial_resume_state = resume_state
+            dataset._current_shard_index = resume_state.shard_index
+            dataset._current_row_index = resume_state.row_index
+            return dataset
+
+        # Check if dataset has _initial_resume_state (might be _ResumableSourceWrapper)
+        if hasattr(dataset, "_initial_resume_state"):
+            dataset._initial_resume_state = resume_state
+            if hasattr(dataset, "_current_shard_index"):
+                dataset._current_shard_index = resume_state.shard_index
+            if hasattr(dataset, "_current_row_index"):
+                dataset._current_row_index = resume_state.row_index
+            return dataset
+
+        # Check for _resume_state attribute (for other wrapper types)
+        if hasattr(dataset, "_resume_state"):
             dataset._resume_state = resume_state
             return dataset
 
@@ -867,6 +924,38 @@ class ContrastiveTrainer(Trainer):
                 self.dataset_train = self._recursive_apply_resume_state(
                     self._original_train_dataset, resume_state, _ResumableSourceWrapper
                 )
+        else:
+            # If resume_if_possible=False, ensure dataset starts from the beginning
+            # Reset any existing ResumeState in the dataset to start from (0, 0)
+            if self._original_train_dataset is not None and hasattr(
+                self._original_train_dataset, "iter_shards"
+            ):
+                # Check if dataset already has a ResumeState that might cause issues
+                existing_resume_state = self._recursive_find_resume_state(
+                    self._original_train_dataset
+                )
+                if existing_resume_state is not None:
+                    # Reset to start from beginning
+                    from easydel.data import ResumeState
+
+                    reset_resume_state = ResumeState(
+                        shard_index=0,
+                        row_index=0,
+                        step=0,
+                        epoch=0,
+                        dataset_states=existing_resume_state.dataset_states
+                        if existing_resume_state.dataset_states
+                        else {},
+                    )
+                    logger.info(
+                        "Resetting dataset ResumeState to start from beginning: "
+                        "shard_index=0, row_index=0 (resume_if_possible=False)"
+                    )
+                    self.dataset_train = self._recursive_apply_resume_state(
+                        self._original_train_dataset,
+                        reset_resume_state,
+                        _ResumableSourceWrapper,
+                    )
 
         # Step 2: Call base class configure_dataloaders
         return super().configure_dataloaders()

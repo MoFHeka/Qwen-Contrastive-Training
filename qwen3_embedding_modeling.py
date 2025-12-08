@@ -670,8 +670,8 @@ def create_from_initial_model(
     param_dtype: jnp.dtype = jnp.bfloat16,
     seed: int = 42,
     quantization_config: Optional[Any] = None,
-    *,
     rngs: Optional[nnx.Rngs] = None,
+    **kwargs,
 ) -> Qwen3EmbeddingModel:
     """
     Create Qwen3EmbeddingModel from initial Qwen model on CPU
@@ -689,6 +689,7 @@ def create_from_initial_model(
       seed: Random seed for projection head initialization
       quantization_config: Optional EasyDeLQuantizationConfig (if None, uses default)
       rngs: Optional random number generators
+      kwargs: Additional keyword arguments
 
     Returns:
       Qwen3EmbeddingModel instance (on CPU, no mesh)

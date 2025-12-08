@@ -393,9 +393,6 @@ def save_easydel_model(
             f"Set overwrite=True to overwrite existing model, or use a different path."
         )
 
-    os.makedirs(save_path, exist_ok=True)
-    print(f"Saving model to {save_path} using {save_method}...")
-
     try:
         # Save model state using selected method
         if save_method == "easydel":

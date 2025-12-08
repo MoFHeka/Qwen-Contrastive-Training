@@ -618,6 +618,7 @@ def run_comprehensive_test(
     verbose: bool = True,
     max_batches: int | None = 5,  # None表示处理所有批次
     max_samples: int | None = None,  # max_samples参数
+    max_sample_length: int | None = None,  # max_sample_length参数
 ):
     """运行全面的测试。
 
@@ -627,6 +628,8 @@ def run_comprehensive_test(
       seq_length: 序列长度
       verbose: 是否打印详细信息
       max_batches: 最大处理批次数量，None表示处理所有批次
+      max_samples: max_samples参数
+      max_sample_length: max_sample_length参数，每个样本的最大长度
     """
     print("=" * 80)
     print("开始全面测试数据加载器")
@@ -657,6 +660,7 @@ def run_comprehensive_test(
             shuffle=False,  # 不 shuffle 以便验证
             seed=42,
             max_samples=max_samples,
+            max_sample_length=max_sample_length,
         )
         print("  ✓ Pipeline 创建成功")
     except Exception as e:
@@ -845,6 +849,7 @@ def run_large_scale_test(
     num_samples: int = 100000,  # 10万样本
     seq_length: int = 2048,
     verbose: bool = True,
+    max_sample_length: int | None = None,  # max_sample_length参数
 ):
     """运行极大量数据测试。
 
@@ -853,6 +858,7 @@ def run_large_scale_test(
       num_samples: 测试样本数量（默认10万）
       seq_length: 序列长度
       verbose: 是否打印详细信息
+      max_sample_length: max_sample_length参数，每个样本的最大长度
     """
     print("=" * 80)
     print("开始极大量数据测试")
@@ -892,6 +898,7 @@ def run_large_scale_test(
             seq_length=seq_length,
             shuffle=True,  # 启用shuffle测试
             seed=42,
+            max_sample_length=max_sample_length,
         )
         print("  ✓ Pipeline 创建成功")
     except Exception as e:
@@ -1003,6 +1010,7 @@ def run_distributed_test(
     samples_per_file: int = 1000,
     seq_length: int = 2048,
     verbose: bool = True,
+    max_sample_length: int | None = None,  # max_sample_length参数
 ):
     """运行多文件/分布式数据测试。
 
@@ -1017,6 +1025,7 @@ def run_distributed_test(
       samples_per_file: 每个文件的样本数量
       seq_length: 序列长度
       verbose: 是否打印详细信息
+      max_sample_length: max_sample_length参数，每个样本的最大长度
     """
     print("=" * 80)
     print("开始多文件/分布式数据测试")
@@ -1070,6 +1079,7 @@ def run_distributed_test(
                 seq_length=seq_length,
                 shuffle=True,  # 启用shuffle
                 seed=42,
+                max_sample_length=max_sample_length,
             )
             print(f"  ✓ Pipeline 创建成功（使用glob pattern: {glob_pattern}）")
 
