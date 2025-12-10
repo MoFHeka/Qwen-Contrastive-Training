@@ -97,7 +97,11 @@ def train_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+
+    def apply_constraint(tensor):
+        return jax.lax.with_sharding_constraint(tensor, partition_spec)
+
+    batch = jax.tree.map(apply_constraint, batch)
 
     def loss_fn(tree, minibatch):
         """
@@ -120,17 +124,18 @@ def train_step(
             "temperature": temperature,
             "max_samples": max_samples,
             "num_negatives": num_negatives,
+            "compute_loss_metrics": False,
         }
 
         # Use module's compute_loss method
-        _outputs, metrics = module.compute_loss(
+        outputs, metrics = module.compute_loss(
             labels=None,  # Not used for contrastive learning
             loss_config=None,  # Not used for contrastive learning
             loss_kwargs=loss_kwargs,
             **minibatch,
         )
 
-        return metrics.loss, metrics
+        return outputs.loss, metrics
 
     # Compute gradients and metrics across minibatches
     gradients, metrics = minibatch_call(
@@ -186,7 +191,11 @@ def eval_step(
         gradient_accumulation_steps=1,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+
+    def apply_constraint(tensor):
+        return jax.lax.with_sharding_constraint(tensor, partition_spec)
+
+    batch = jax.tree.map(apply_constraint, batch)
 
     def loss_fn(tree):
         """
@@ -209,6 +218,7 @@ def eval_step(
             "temperature": temperature,
             "max_samples": max_samples,
             "num_negatives": num_negatives,
+            "compute_loss_metrics": True,
         }
 
         # Use module's compute_loss method

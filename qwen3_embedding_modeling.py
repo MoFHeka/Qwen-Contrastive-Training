@@ -8,15 +8,13 @@ and projection head. The new model shares the same mesh as the base model.
 import os
 import copy
 
-from typing import Optional, Any, Mapping, Sequence, Callable
+from typing import Optional, Any
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec
 
 from flax import nnx
 import chex
-import optax
 
 from ejkernel.types import MaskInfo
 
@@ -33,16 +31,29 @@ BASE_MODEL_TYPE = "qwen3"
 CUSTOM_ARCHITECTURE_NAME = "Qwen3EmbeddingModel"
 
 
-class ProjectionHead(EasyDeLBaseModule):
+class ProjectionHead(nnx.Module):
     """
     GELU projection head to reduce embedding dimension to 256
     """
 
+    config: Qwen3EmbeddingConfig
+    input_dim: int
+    output_dim: int
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    precision: jax.lax.PrecisionLike
+    rngs: nnx.Rngs
+
     def __init__(
         self,
+        config: Qwen3EmbeddingConfig,
         input_dim: int,
         output_dim: int = 256,
         dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype=jnp.float32,
+        use_bias=True,
+        kernel_init=nnx.initializers.lecun_normal(),
+        precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nnx.Rngs,
     ):
@@ -55,12 +66,51 @@ class ProjectionHead(EasyDeLBaseModule):
           dtype: Data type
           rngs: Random number generators
         """
+
+        super().__init__()
+        self.config = config
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.dtype = dtype
+        self.dtype: jnp.dtype = dtype
+        self.param_dtype: jnp.dtype = param_dtype
+        self.precision: jax.lax.PrecisionLike = precision
+        self.rngs: nnx.Rngs = rngs
 
         # Linear layer: input_dim -> output_dim
-        self.linear = nnx.Linear(input_dim, output_dim, dtype=dtype, rngs=rngs)
+        linear_class = ed.layers.linear.ColumnParallelLinear
+        if (
+            config
+            and hasattr(config, "gradient_checkpointing")
+            and config.gradient_checkpointing
+        ):
+            linear_class = ed.infra.utils.auto_remat(
+                linear_class,
+                policy=config.gradient_checkpointing,
+                save_names=config.gradient_checkpointing_targets,
+                exclude_names=config.gradient_checkpointing_targets,
+            )
+
+        current_dim = input_dim
+        seq = [current_dim]
+        while current_dim > output_dim:
+            current_dim = current_dim // 2
+            seq.append(current_dim)
+        seq[-1] = output_dim
+
+        self.linear_blocks = []
+        for i in range(len(seq) - 1):
+            self.linear_blocks.append(
+                linear_class(
+                    seq[i],
+                    seq[i + 1],
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    use_bias=use_bias,
+                    kernel_init=kernel_init,
+                    precision=precision,
+                    rngs=rngs,
+                )
+            )
 
     def __call__(self, x: chex.Array) -> chex.Array:
         """
@@ -72,9 +122,10 @@ class ProjectionHead(EasyDeLBaseModule):
         Returns:
           Projected embeddings [..., output_dim]
         """
-        x = self.linear(x.astype(self.dtype))
-        # Apply GELU activation
-        x = nnx.gelu(x)
+        for i, linear_block in enumerate(self.linear_blocks):
+            x = linear_block(x)
+            if i < len(self.linear_blocks) - 1:
+                x = nnx.gelu(x)
         return x
 
 
@@ -92,13 +143,13 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
     def __init__(
         self,
-        config: Any,
+        config: Qwen3EmbeddingConfig,
         embedding_dim: int = 256,
-        dtype: Optional[jnp.dtype] = None,
-        param_dtype: Optional[jnp.dtype] = None,
-        precision: Optional[jax.lax.Precision] = None,
-        rngs: Optional[nnx.Rngs] = None,
-        quantization_config: Optional[Any] = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.Precision = None,
+        rngs: nnx.Rngs = None,
+        quantization_config: ed.EasyDeLQuantizationConfig = None,
     ):
         """
         Initialize independent model from config
@@ -112,8 +163,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
           rngs: Random number generators (if None, create new one)
           quantization_config: Optional EasyDeLQuantizationConfig (if None, uses default)
         """
-        if config is None:
-            raise ValueError("Qwen3EmbeddingModel requires config to build model")
 
         if rngs is None:
             key = jax.random.PRNGKey(42)
@@ -161,7 +210,13 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         hidden_size = getattr(config, "hidden_size", 2560)
         embedding_dim = getattr(config, "embedding_dim", embedding_dim)
         self.projection = ProjectionHead(
-            input_dim=hidden_size, output_dim=embedding_dim, dtype=dtype, rngs=rngs
+            config=config,
+            input_dim=hidden_size,
+            output_dim=embedding_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
         self.embedding_dim = embedding_dim
 
@@ -187,10 +242,10 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: Optional[chex.Array] = None,
-        segment_ids: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        triplet_type: Optional[chex.Array] = None,
+        attention_mask: chex.Array | None = None,
+        segment_ids: chex.Array | None = None,
+        position_ids: chex.Array | None = None,
+        triplet_type: chex.Array | None = None,
         max_samples: int = 64,
         num_negatives: int = 1,
         output_hidden_states: bool = False,
@@ -304,7 +359,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
             if output_hidden_states:
 
-                class ModelOutput:
+                class ModelOutput(ed.infra.modeling_outputs.ModelOutput):
                     def __init__(self, last_hidden_state, projected_embeddings):
                         self.last_hidden_state = last_hidden_state
                         self.projected_embeddings = projected_embeddings
@@ -357,6 +412,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         temperature = loss_kwargs.get("temperature", 0.07)
         max_samples = loss_kwargs.get("max_samples", 64)
         num_negatives = loss_kwargs.get("num_negatives", 1)
+        compute_loss_metrics = loss_kwargs.get("compute_loss_metrics", False)
 
         # Extract required batch fields
         input_ids = batch.get("input_ids")
@@ -419,21 +475,26 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             pos_mask=pos_mask,
             negs_mask=negs_mask,
             temperature=temperature,
-            return_metrics=True,
+            return_metrics=compute_loss_metrics,
         )
 
         # Convert contrastive metrics to LossMetrics format
-        metrics = LossMetrics(
-            loss=loss,
-            accuracy=contrastive_metrics.get("accuracy"),
-            other_metrics={
-                "valid_samples": contrastive_metrics.get("valid_samples"),
-                "pos_sim_mean": contrastive_metrics.get("pos_sim_mean"),
-                "neg_sim_mean": contrastive_metrics.get("neg_sim_mean"),
-                "pos_sim_std": contrastive_metrics.get("pos_sim_std"),
-                "neg_sim_std": contrastive_metrics.get("neg_sim_std"),
-            },
-        )
+        if compute_loss_metrics:
+            metrics = LossMetrics(
+                loss=loss,
+                accuracy=contrastive_metrics.get("accuracy"),
+                other_metrics={
+                    "valid_samples": contrastive_metrics.get("valid_samples"),
+                    "pos_sim_mean": contrastive_metrics.get("pos_sim_mean"),
+                    "neg_sim_mean": contrastive_metrics.get("neg_sim_mean"),
+                    "pos_sim_std": contrastive_metrics.get("pos_sim_std"),
+                    "neg_sim_std": contrastive_metrics.get("neg_sim_std"),
+                },
+            )
+        else:
+            metrics = LossMetrics(
+                loss=loss,
+            )
 
         # Create output object for compatibility
         class ModelOutput:
@@ -669,9 +730,9 @@ def create_from_initial_model(
     dtype: jnp.dtype = jnp.bfloat16,
     param_dtype: jnp.dtype = jnp.bfloat16,
     seed: int = 42,
-    quantization_config: Optional[Any] = None,
-    rngs: Optional[nnx.Rngs] = None,
-    **kwargs,
+    quantization_config: ed.EasyDeLQuantizationConfig = None,
+    *,
+    rngs: nnx.Rngs = None,
 ) -> Qwen3EmbeddingModel:
     """
     Create Qwen3EmbeddingModel from initial Qwen model on CPU

@@ -96,7 +96,20 @@ def initialize_and_save_model(
         print("  使用 --overwrite_model 参数可以重新创建模型")
         return save_path
 
-    print(f"\n[1/2] 创建模型从: {initial_model}")
+    # 1. 加载 tokenizer
+    print(f"\n[1/3] 加载 tokenizer 从: {initial_model}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(initial_model, trust_remote_code=True)
+        print("✓ Tokenizer 加载成功")
+    except Exception as e:
+        print(f"✗ Tokenizer 加载失败: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+    # 2. 创建模型
+    print(f"\n[2/3] 创建模型从: {initial_model}")
     try:
         model = create_from_initial_model(
             initial_model=initial_model,
@@ -113,8 +126,10 @@ def initialize_and_save_model(
         traceback.print_exc()
         raise
 
-    print(f"\n[2/2] 保存模型到: {save_path}")
+    # 3. 保存模型和 tokenizer
+    print(f"\n[3/3] 保存模型和 tokenizer 到: {save_path}")
     try:
+        # 保存模型
         save_easydel_model(
             model=model,
             save_path=save_path,
@@ -125,15 +140,20 @@ def initialize_and_save_model(
             dtype=dtype,
         )
         print("✓ 模型保存成功")
+
+        # 保存 tokenizer 到单独的子文件夹
+        tokenizer_path = os.path.join(save_path, "tokenizer")
+        tokenizer.save_pretrained(tokenizer_path)
+        print(f"✓ Tokenizer 保存成功: {tokenizer_path}")
     except Exception as e:
-        print(f"✗ 模型保存失败: {e}")
+        print(f"✗ 保存失败: {e}")
         import traceback
 
         traceback.print_exc()
         raise
 
     print("\n" + "=" * 80)
-    print("模型初始化完成!")
+    print("模型和 Tokenizer 初始化完成!")
     print("=" * 80)
     return save_path
 
@@ -169,24 +189,40 @@ def test_contrastive_trainer(
         test_data_file = os.path.join(temp_dir, "test_data.jsonl")
         create_test_data(num_samples=num_samples, output_file=test_data_file)
 
-        # 2. 加载 tokenizer（从保存的模型路径获取模型名称）
+        # 2. 加载 tokenizer（优先从保存的模型路径加载）
         print("\n[2/6] 加载 tokenizer...")
         try:
-            # 尝试从保存的模型路径读取配置来获取模型名称
-            # 如果失败，使用默认值
-            model_name = "Qwen/Qwen3-Embedding-0.6B"
+            tokenizer = None
+            # 优先尝试从保存的模型路径的 tokenizer 子文件夹加载
             if os.path.exists(saved_model_path):
-                config_path = os.path.join(saved_model_path, "config.json")
-                if os.path.exists(config_path):
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        config = json.load(f)
-                        if "model_name_or_path" in config:
-                            model_name = config["model_name_or_path"]
+                tokenizer_path = os.path.join(saved_model_path, "tokenizer")
+                tokenizer_config_path = os.path.join(
+                    tokenizer_path, "tokenizer_config.json"
+                )
+                vocab_path = os.path.join(tokenizer_path, "vocab.json")
+                if os.path.exists(tokenizer_config_path) or os.path.exists(vocab_path):
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(
+                            tokenizer_path, trust_remote_code=True
+                        )
+                        print(f"✓ Tokenizer 从保存路径加载成功: {tokenizer_path}")
+                    except Exception as e:
+                        print(f"  从保存路径加载失败: {e}，尝试从原始模型加载...")
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name, trust_remote_code=True
-            )
-            print(f"✓ Tokenizer 加载成功: {model_name}")  # noqa: F541
+            # 如果从保存路径加载失败，尝试从原始模型加载
+            if tokenizer is None:
+                model_name = "Qwen/Qwen3-Embedding-0.6B"
+                if os.path.exists(saved_model_path):
+                    config_path = os.path.join(saved_model_path, "config.json")
+                    if os.path.exists(config_path):
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            config = json.load(f)
+                            if "model_name_or_path" in config:
+                                model_name = config["model_name_or_path"]
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, trust_remote_code=True
+                )
+                print(f"✓ Tokenizer 从原始模型加载成功: {model_name}")
         except Exception as e:
             print(f"✗ Tokenizer 加载失败: {e}")
             print("  尝试使用本地模型路径...")
@@ -390,23 +426,40 @@ def test_resume_training(
         print("\n[步骤 1/7] 创建测试数据...")
         create_test_data(num_samples=num_samples, output_file=test_data_file)
 
-        # 2. 加载 tokenizer（从保存的模型路径获取模型名称）
+        # 2. 加载 tokenizer（优先从保存的模型路径加载）
         print("\n[步骤 2/7] 加载 tokenizer...")
         try:
-            # 尝试从保存的模型路径读取配置来获取模型名称
-            model_name = "Qwen/Qwen3-Embedding-0.6B"
+            tokenizer = None
+            # 优先尝试从保存的模型路径的 tokenizer 子文件夹加载
             if os.path.exists(saved_model_path):
-                config_path = os.path.join(saved_model_path, "config.json")
-                if os.path.exists(config_path):
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        config = json.load(f)
-                        if "model_name_or_path" in config:
-                            model_name = config["model_name_or_path"]
+                tokenizer_path = os.path.join(saved_model_path, "tokenizer")
+                tokenizer_config_path = os.path.join(
+                    tokenizer_path, "tokenizer_config.json"
+                )
+                vocab_path = os.path.join(tokenizer_path, "vocab.json")
+                if os.path.exists(tokenizer_config_path) or os.path.exists(vocab_path):
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(
+                            tokenizer_path, trust_remote_code=True
+                        )
+                        print(f"✓ Tokenizer 从保存路径加载成功: {tokenizer_path}")
+                    except Exception as e:
+                        print(f"  从保存路径加载失败: {e}，尝试从原始模型加载...")
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name, trust_remote_code=True
-            )
-            print(f"✓ Tokenizer 加载成功: {model_name}")
+            # 如果从保存路径加载失败，尝试从原始模型加载
+            if tokenizer is None:
+                model_name = "Qwen/Qwen3-Embedding-0.6B"
+                if os.path.exists(saved_model_path):
+                    config_path = os.path.join(saved_model_path, "config.json")
+                    if os.path.exists(config_path):
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            config = json.load(f)
+                            if "model_name_or_path" in config:
+                                model_name = config["model_name_or_path"]
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, trust_remote_code=True
+                )
+                print(f"✓ Tokenizer 从原始模型加载成功: {model_name}")
         except Exception as e:
             print(f"✗ Tokenizer 加载失败: {e}")
             return

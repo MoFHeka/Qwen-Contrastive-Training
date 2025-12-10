@@ -46,13 +46,17 @@ from __future__ import annotations
 
 import json
 import os
+import typing as tp
 from dataclasses import dataclass
+
+if tp.TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
 
 import jax.numpy as jnp
 import numpy as np
 from transformers import PreTrainedTokenizer
 
-from collections.abc import Iterator, Sequence
+from eformer.loggings import get_logger
 
 from easydel.data import (
     DatasetConfig,
@@ -64,7 +68,11 @@ from easydel.data import (
     ShardedDataSource,
 )
 from easydel.data.transforms import Transform, TransformedShardedSource
+
 from extended_pack import ContrastivePackedShardedSource
+
+
+logger = get_logger(__name__)
 
 # =======================================================
 # ResumeState utility functions
@@ -203,6 +211,9 @@ class ContrastiveInputTransform(Transform):
 
         # Apply truncation if max_sample_length is specified
         if self.max_sample_length is not None:
+            # At least one token from each negative sample should be included
+            if (len(anchor_tokens) + len(positive_tokens)) >= self.max_sample_length:
+                return None
             all_tokens = all_tokens[: self.max_sample_length]
             triplet_type = triplet_type[: self.max_sample_length]
 
@@ -230,6 +241,7 @@ def create_dataset_pipeline(
     batch_size: int = 8,
     seq_length: int = 32768,
     max_samples: int | None = 128,
+    max_sample_length: int | None = 5120,
     eos_token_id: int | None = None,
     pad_token_id: int = 0,
     shuffle: bool = True,
@@ -238,7 +250,6 @@ def create_dataset_pipeline(
     strategy: str = "greedy",
     resume_state: ResumeState | None = None,
     add_special_tokens: bool = True,
-    max_sample_length: int | None = None,
 ) -> Pipeline:
     """Create a Pipeline for triplet data with triplet_type preserved.
 
@@ -251,6 +262,9 @@ def create_dataset_pipeline(
                    is reached, the current packer is flushed and a new one is created.
                    If None, no limit is enforced (default: 128). When set, num_samples in
                    DataSampleInfo will be None for static graph compilation.
+      max_sample_length: Maximum length for each individual sample (anchor, positive, or negative).
+                  If specified, each text segment will be truncated to this length.
+                  If None, no truncation is applied (default: None).
       eos_token_id: EOS token ID (default: tokenizer.eos_token_id)
       pad_token_id: Padding token ID
       shuffle: Whether to shuffle packed sequences
@@ -259,9 +273,6 @@ def create_dataset_pipeline(
       strategy: Packing strategy. Valid values: "greedy", "pool", "first_fit"
       resume_state: Optional ResumeState to resume from a checkpoint
       add_special_tokens: Whether to add trainable special tokens during tokenization.
-      max_sample_length: Maximum length for each individual sample (anchor, positive, or negative).
-                  If specified, each text segment will be truncated to this length.
-                  If None, no truncation is applied (default: None).
 
     Returns:
       Pipeline object ready to be chained with stages
@@ -280,6 +291,14 @@ def create_dataset_pipeline(
         raise ValueError(
             "eos_token_id must be provided or tokenizer must have eos_token_id"
         )
+
+    if max_sample_length and max_sample_length > seq_length:
+        logger.warning(
+            f"max_sample_length {max_sample_length} must be less than or equal to seq_length {seq_length}\n"
+            "setting max_sample_length to seq_length\n"
+            f"max_sample_length: {max_sample_length} -> {seq_length}\n"
+        )
+        max_sample_length = seq_length
 
     # Create Pipeline config
     config = PipelineConfig(
@@ -412,7 +431,7 @@ def create_dataset_source(
     batch_size: int = 8,
     seq_length: int = 32768,
     max_samples: int | None = 128,
-    max_sample_length: int | None = None,
+    max_sample_length: int | None = 5120,
     eos_token_id: int | None = None,
     pad_token_id: int = 0,
     shuffle: bool = True,
@@ -478,6 +497,7 @@ def create_dataset_source(
             batch_size=batch_size,
             seq_length=seq_length,
             max_samples=max_samples,
+            max_sample_length=max_sample_length,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             shuffle=shuffle,
@@ -486,7 +506,6 @@ def create_dataset_source(
             strategy=strategy,
             resume_state=resume_state,
             add_special_tokens=add_special_tokens,
-            max_sample_length=max_sample_length,
         )
 
     # Get ShardedDataSource from pipeline after pack and load stages

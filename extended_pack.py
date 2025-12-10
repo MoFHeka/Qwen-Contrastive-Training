@@ -23,6 +23,9 @@ from easydel.data.transforms.pack import (
     FirstFitPacker,
 )
 from easydel.data import ShardedDataSource
+from eformer.loggings import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -87,24 +90,110 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             int
         ] = []  # Used to generate segment_ids (indicates which sample each token belongs to)
 
+    def _create_independent_pack(
+        self, tokens: list[int], triplet_types: list[int], source_id: str | None = None
+    ) -> ContrastivePackedSequence:
+        """
+        Create an independent pack from tokens without affecting the current buffer.
+
+        This method uses temporary buffers to create a pack, leaving the main buffer untouched.
+        """
+        # Use temporary buffers
+        temp_buffer = list(tokens)
+        temp_triplet_type_buffer = list(triplet_types)
+        temp_sample_index_buffer = [0] * len(tokens)  # Single sample, segment_id = 0
+        temp_source_ids = [source_id] if source_id else []
+
+        # Create pack using the same logic as flush_final but with temporary data
+        current_len = len(temp_buffer)
+        pad_len = self.seq_length - current_len
+
+        # 1. Input IDs: Pad with pad_token_id
+        input_ids = np.array(
+            temp_buffer + [self.pad_token_id] * pad_len, dtype=np.int32
+        )
+
+        # 2. Segment Type: Pad with -1
+        triplet_type = np.array(
+            temp_triplet_type_buffer + [-1] * pad_len, dtype=np.int32
+        )
+
+        # 3. Segment IDs: All tokens belong to segment 0, padding uses 1
+        segment_ids = np.array(temp_sample_index_buffer + [1] * pad_len, dtype=np.int32)
+
+        # 4. Attention Mask
+        attention_mask = np.array([1] * current_len + [0] * pad_len, dtype=np.int32)
+
+        # 5. Position IDs: Start from 0 for the single sample
+        position_ids = np.zeros(self.seq_length, dtype=np.int32)
+        for i in range(current_len):
+            position_ids[i] = i
+
+        # Create Result
+        result = ContrastivePackedSequence(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            triplet_type=triplet_type,
+            position_ids=position_ids,
+            source_ids=temp_source_ids.copy() if temp_source_ids else None,
+            num_segments=1,
+        )
+
+        return result
+
     def add(
         self, tokens: list[int], triplet_types: list[int], source_id: str | None = None
     ) -> ContrastivePackedSequence | None:
         """
         Add tokens and segment types to the packer.
+
+        Note: If a sample exceeds seq_length, it will be truncated to seq_length
+        and packed independently (as a separate pack). The current buffer is NOT affected
+        and can continue accumulating samples normally.
+
+        Returns:
+            ContrastivePackedSequence or None. Returns a pack when:
+            - Buffer is flushed due to capacity limits (normal case)
+            - A long sample is packed independently (independent pack path)
+            Returns None when sample is added to buffer without flushing.
         """
         result = None
-        seq_len = len(tokens)
+        sample_tokens_len = len(tokens)
 
-        # if the sequence is too long to fit in the buffer, truncate it
-        if seq_len > self.seq_length:
-            seq_len = self.seq_length
-            tokens = tokens[: self.seq_length]
-            triplet_types = triplet_types[: self.seq_length]
+        # Validate input lengths match
+        if len(triplet_types) != sample_tokens_len:
+            raise ValueError(
+                f"tokens and triplet_types length mismatch: "
+                f"tokens={sample_tokens_len}, triplet_types={len(triplet_types)}"
+            )
 
+        # Handle case where sample exceeds seq_length
+        if sample_tokens_len > self.seq_length:
+            logger.warning(
+                f"Sample length ({sample_tokens_len}) exceeds seq_length ({self.seq_length}). "
+                f"Truncating to sample_tokens_len and packing independently. "
+                f"Consider using max_sample_length parameter in upstream processing."
+            )
+
+            # Truncate the long sample
+            truncated_tokens = tokens[: self.seq_length]
+            truncated_triplet_types = triplet_types[: self.seq_length]
+
+            # Create independent pack without affecting current buffer
+            # This allows the buffer to continue accumulating samples normally
+            independent_pack = self._create_independent_pack(
+                truncated_tokens, truncated_triplet_types, source_id
+            )
+
+            # Return the independent pack
+            # Note: Current buffer is NOT affected, can continue adding samples normally
+            return independent_pack
+
+        # Normal case: sample fits within seq_length
         # 1. Check Fit Conditions
         # Note: We do NOT add +1 for EOS here (Requirement 2)
-        fits_in_length = (len(self._buffer) + seq_len) <= self.seq_length
+        fits_in_length = (len(self._buffer) + sample_tokens_len) <= self.seq_length
         fits_in_samples = self._current_segment + 1 <= self.max_samples
 
         # 2. Flush if it doesn't fit
@@ -119,7 +208,7 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
         # Track sample index for segment_ids generation
         # All tokens in this segment (anchor, positive, negatives) belong to the same sample
         # segment_ids indicates which sample each token belongs to
-        self._sample_index_buffer.extend([self._current_segment] * seq_len)
+        self._sample_index_buffer.extend([self._current_segment] * sample_tokens_len)
 
         if source_id:
             self._source_ids.append(source_id)
@@ -134,6 +223,19 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             return None
 
         current_len = len(self._buffer)
+
+        # Handle case where buffer exceeds seq_length (should not happen after add validation, but be safe)
+        if current_len > self.seq_length:
+            logger.warning(
+                f"Buffer length ({current_len}) exceeds seq_length ({self.seq_length}). "
+                f"Truncating to seq_length. This should not happen if add() validation works correctly."
+            )
+            # Truncate buffers to seq_length
+            self._buffer = self._buffer[: self.seq_length]
+            self._triplet_type_buffer = self._triplet_type_buffer[: self.seq_length]
+            self._sample_index_buffer = self._sample_index_buffer[: self.seq_length]
+            current_len = self.seq_length
+
         pad_len = self.seq_length - current_len
 
         # 1. Input IDs: Pad with pad_token_id

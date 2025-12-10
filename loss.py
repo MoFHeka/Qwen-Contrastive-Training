@@ -26,9 +26,13 @@ def info_nce_loss(
     sample_valid_mask = anchor_mask & pos_mask
     valid_count = jnp.sum(sample_valid_mask) + 1e-8
 
-    # 2. L2 Normalization (Zero-copy safe)
-    def normalize(x):
-        return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+    # 2. L2 Normalization
+    def normalize(x, eps=1e-8):
+        origin_type = x.dtype
+        x = jnp.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4).astype(jnp.float32)
+        # jnp.linalg.norm will fail if use low-version cuda driver
+        norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+        return (x / (norm + eps)).astype(origin_type)
 
     anchor_norm = normalize(anchor_emb)  # [B, S, H]
     positive_norm = normalize(positive_emb)  # [B, S, H]
@@ -115,7 +119,6 @@ def info_nce_loss(
             "neg_sim_std": neg_sim_std,
         }
 
-    if return_metrics:
         return loss, metrics
-    else:
-        return loss
+
+    return loss, {}

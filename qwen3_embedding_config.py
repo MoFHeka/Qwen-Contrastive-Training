@@ -112,10 +112,8 @@ class Qwen3EmbeddingConfig(EasyDeLBaseConfig):
                 pmag.resolve(Replicated),
             ),
             # Projection head partition rules
-            (r"projection/linear/kernel", pmag.resolve(RowWise)),
-            (r"projection/linear/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
+            (r"projection/linear*/kernel", pmag.resolve(Replicated)),
+            (r"projection/linear*/bias", pmag.resolve(Replicated)),
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
