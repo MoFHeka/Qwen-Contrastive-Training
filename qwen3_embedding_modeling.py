@@ -22,6 +22,8 @@ import easydel as ed
 from easydel.infra import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, registry
 from easydel.infra.loss_utils import LossMetrics, LossConfig
+from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.utils import auto_remat, auto_pytree
 
 from qwen3_embedding_config import Qwen3EmbeddingConfig
 from loss import info_nce_loss
@@ -83,7 +85,7 @@ class ProjectionHead(nnx.Module):
             and hasattr(config, "gradient_checkpointing")
             and config.gradient_checkpointing
         ):
-            linear_class = ed.infra.utils.auto_remat(
+            linear_class = auto_remat(
                 linear_class,
                 policy=config.gradient_checkpointing,
                 save_names=config.gradient_checkpointing_targets,
@@ -127,6 +129,18 @@ class ProjectionHead(nnx.Module):
             if i < len(self.linear_blocks) - 1:
                 x = nnx.gelu(x)
         return x
+
+
+# Make a class into a pytree node.
+# If you don't want to use class, return a Python Dict instead.
+# Python Dict would be transformed into a pytree automatically by Jax.
+@auto_pytree
+class Qwen3EmbeddingModelOutput(ModelOutput):
+    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: chex.Array = None
+    projected_hidden_state: chex.Array = None
+    packed_sample_slot_mask: chex.Array = None
+    loss: chex.Array | None = None
 
 
 class Qwen3EmbeddingModel(EasyDeLBaseModule):
@@ -328,6 +342,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         else:
             hidden_states = base_outputs
 
+        slot_mask = None
         if triplet_type is not None:
             # Extract and project embeddings for triplet-based training
             # max_samples is a static parameter for JIT compilation
@@ -347,29 +362,19 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
             # 2. 投影 (一次性投影所有向量，效率最高)
             projected_embs = self.projection(combined_embs)
-
-            # Return projected embeddings and slot mask for external loss computation
-            if output_hidden_states:
-                return (projected_embs, slot_mask, hidden_states)
-            else:
-                return (projected_embs, slot_mask)
         else:
             # Standard forward pass without triplet extraction
-            projected_embeddings = self.projection(hidden_states)
+            projected_embs = self.projection(hidden_states)
 
-            if output_hidden_states:
-
-                class ModelOutput(ed.infra.modeling_outputs.ModelOutput):
-                    def __init__(self, last_hidden_state, projected_embeddings):
-                        self.last_hidden_state = last_hidden_state
-                        self.projected_embeddings = projected_embeddings
-
-                return ModelOutput(
-                    last_hidden_state=hidden_states,
-                    projected_embeddings=projected_embeddings,
-                )
-            else:
-                return projected_embeddings
+        if output_hidden_states:
+            return Qwen3EmbeddingModelOutput(
+                last_hidden_state=hidden_states,
+                projected_hidden_state=projected_embs,
+                hidden_states=base_outputs.hidden_states,
+                packed_sample_slot_mask=slot_mask,
+            )
+        else:
+            return projected_embs
 
     def compute_loss(
         self,
@@ -446,16 +451,12 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             triplet_type=triplet_type,
             max_samples=max_samples,
             num_negatives=num_negatives,
-            output_hidden_states=False,
+            output_hidden_states=True,
         )
 
         # Model returns (projected_embs, slot_mask)
-        if isinstance(model_output, tuple):
-            projected_embs, slot_mask = model_output
-        else:
-            raise ValueError(
-                "Model must return (projected_embs, slot_mask) tuple for contrastive learning"
-            )
+        projected_embs = model_output.projected_hidden_state
+        slot_mask = model_output.packed_sample_slot_mask
 
         # Split embeddings and masks
         # Slot structure: [Anchor(0), Positive(1), Negatives(2...)]
@@ -480,7 +481,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
         # Convert contrastive metrics to LossMetrics format
         if compute_loss_metrics:
-            metrics = LossMetrics(
+            loss_output = LossMetrics(
                 loss=loss,
                 accuracy=contrastive_metrics.get("accuracy"),
                 other_metrics={
@@ -492,24 +493,17 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 },
             )
         else:
-            metrics = LossMetrics(
+            loss_output = LossMetrics(
                 loss=loss,
             )
 
         # Create output object for compatibility
-        class ModelOutput:
-            def __init__(self, projected_embs, slot_mask, loss):
-                self.projected_embs = projected_embs
-                self.slot_mask = slot_mask
-                self.loss = loss
+        if hasattr(model_output, "aux_loss"):
+            if model_output.aux_loss is not None:
+                loss_output.loss = loss_output.loss + model_output.aux_loss
+        model_output = model_output.replace(loss=loss_output.loss)
 
-        outputs = ModelOutput(
-            projected_embs=projected_embs,
-            slot_mask=slot_mask,
-            loss=loss,
-        )
-
-        return outputs, metrics
+        return model_output, loss_output
 
     def _extract_last_token_embeddings(
         self,

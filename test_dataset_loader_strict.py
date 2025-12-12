@@ -508,7 +508,6 @@ def test_max_samples():
                                 max_samples is not None
                                 and seq_info.num_samples > max_samples
                             ):
-                                breakpoint()
                                 print(
                                     f"  ✗ 错误: batch {batch_count} 中的序列 {i} 包含 {seq_info.num_samples} 个样本，超过max_samples={max_samples}"
                                 )
