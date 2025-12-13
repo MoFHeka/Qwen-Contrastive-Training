@@ -349,8 +349,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             # Should match the max_samples value used in create_dataset_pipeline
 
             # 1. 提取 (得到大宽表)
-            # combined: [B, S, 2+N, H]
-            # mask:     [B, S, 2+N]
+            # combined: [B, Samples, 2+Num_Negatives, H]
+            # mask:     [B, Samples, 2+Num_Negatives]
             combined_embs, slot_mask = self._extract_last_token_embeddings(
                 hidden_states=hidden_states,
                 segment_ids=segment_ids,
@@ -460,12 +460,12 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
         # Split embeddings and masks
         # Slot structure: [Anchor(0), Positive(1), Negatives(2...)]
-        anchor_emb = projected_embs[..., 0, :]  # [B, S, H]
-        anchor_mask = slot_mask[..., 0]  # [B, S]
-        positive_emb = projected_embs[..., 1, :]  # [B, S, H]
-        pos_mask = slot_mask[..., 1]  # [B, S]
-        negatives_emb = projected_embs[..., 2:, :]  # [B, S, N, H]
-        negs_mask = slot_mask[..., 2:]  # [B, S, N]
+        anchor_emb = projected_embs[..., 0, :]  # [B, Samples, H]
+        anchor_mask = slot_mask[..., 0]  # [B, Samples]
+        positive_emb = projected_embs[..., 1, :]  # [B, Samples, H]
+        pos_mask = slot_mask[..., 1]  # [B, Samples]
+        negatives_emb = projected_embs[..., 2:, :]  # [B, Samples, Num_Negatives, H]
+        negs_mask = slot_mask[..., 2:]  # [B, Samples, Num_Negatives]
 
         # Compute InfoNCE loss and metrics
         loss, contrastive_metrics = info_nce_loss(
@@ -543,43 +543,59 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             # # 主要依赖 attention_mask 来过滤 padding (mask=0)
             # # 同时过滤非法 Type (<0)
             # is_valid_token = (mask > 0) & (s_types >= 0)
-
+            #
             # # B. 边界检查
             # # 确保 Sample ID 和 Type ID 在预设范围内
             # # Padding positions use segment_id = max(actual_segment_ids) + 1,
             # # which will be >= max_samples in most cases, but we rely on attention_mask for filtering
             # in_bounds = (s_ids < max_samples) & (s_types < num_slots)
-
+            #
             # total_valid_mask = is_valid_token & in_bounds
 
             # A + B. 快速路径，只用 attention_mask 来过滤 padding
-            total_valid_mask = mask > 0
+            total_valid_mask = mask
 
             # C. 计算 Scatter Index (扁平化索引)
             # 唯一 ID = sample_id * num_slots + type_id
-            # 例如: Sample 0 的 Anchor=0, Pos=1, Neg1=2...
-            #       Sample 1 的 Anchor=num_slots, ...
+            # 例如:
+            # Sample 0 的 Anchor=[0, 0, ..., 0], Pos=[1, 1, ..., 1], Neg1=[2, 2, ..., 2], ...
+            # Sample 1 的 Anchor=[num_slots, num_slots, ..., num_slots], Pos=[num_slots+1, num_slots+1, ..., num_slots+1], ...
+            # ...
             scatter_indices = s_ids * num_slots + s_types
 
-            # 将无效位置设为越界值 (max_samples * num_slots)
-            out_of_bound_idx = max_samples * num_slots
+            # 边界检查：确保 scatter_indices 在有效范围内
+            num_slots_total = max_samples * num_slots
+            in_bounds = scatter_indices < num_slots_total
+
+            # 综合有效性检查：attention_mask 和边界检查
+            total_valid_mask = mask & in_bounds
+
+            # 将无效位置设为越界值
+            out_of_bound_idx = num_slots_total
             safe_scatter_indices = jnp.where(
                 total_valid_mask, scatter_indices, out_of_bound_idx
             )
 
-            # D. 寻找 EOS Token Index (Scatter Max)
-            # 这里的逻辑是：对于同一个 (Sample, Type) 组，
-            # index 最大的那个 token 自然就是 EOS token (因为是 causal mask，顺序排列)。
-            # 我们不需要知道 EOS 具体是哪个数值，只需要取最后一个即可。
+            # D. 寻找 EOS Token Index (简化版本)
+            # 问题：给定 scatter_indices 数组，需要找到每个唯一值最后出现的位置
+            # 例如：scatter_indices = [0,0,0,1,1,2,2,2,3,3,4,5,6,6,6,7,7,7,8,8,9,9,越界,越界]
+            # 需要得到：0->2, 1->4, 2->7, 3->9, 4->10, 5->11, 6->14, 7->17, 8->19, 9->21
 
-            # 初始化为 -1 (代表该槽位为空)
-            init_indices = jnp.full((max_samples * num_slots,), -1, dtype=jnp.int32)
-            seq_indices = jnp.arange(seq_len, dtype=jnp.int32)
+            # 简化方案：使用 scatter_max，但确保越界索引不会影响有效结果
 
-            # 找到每个槽位的最大索引 (即 EOS 位置)
-            eos_indices = init_indices.at[safe_scatter_indices].max(
-                seq_indices, mode="drop"
-            )
+            # 注意：safe_scatter_indices 已经将无效位置设为 out_of_bound_idx
+            # out_of_bound_idx = num_slots_total，所以无效位置指向最后一个槽位
+
+            # 初始化索引数组（包含一个额外的槽位用于无效位置）
+            init_array = jnp.full((num_slots_total + 1,), -1, dtype=jnp.int32)
+            seq_array = jnp.arange(seq_len, dtype=jnp.int32)
+
+            # 执行 scatter_max：对于每个槽位，取最大的序列索引
+            # mode="drop" 确保越界索引不会引发错误
+            result = init_array.at[safe_scatter_indices].max(seq_array, mode="drop")
+
+            # 提取有效槽位的结果（去掉最后一个无效槽位）
+            eos_indices = result[:-1]
 
             # E. 提取 (Gather)
             # 如果 eos_index 是 -1，用 0 代替防止 gather 越界，随后会 mask 掉

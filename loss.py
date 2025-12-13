@@ -2,203 +2,252 @@
 InfoNCE loss function for contrastive learning
 """
 
+import chex
 import jax
 import jax.numpy as jnp
+from jax import custom_vjp
+
 from typing import Tuple, Dict
 
 
+def inspect_grad(x, name):
+    """
+    Identity Function for print gradients
+    """
+
+    @custom_vjp
+    def _probe(val):
+        return val
+
+    def _probe_fwd(val):
+        return val, ()
+
+    def _probe_bwd(res, g):
+        jax.debug.print(
+            "[{n}] Grad Shape: {s} | Mean: {m} | Min: {mi} | Max: {ma}",
+            n=name,
+            s=g.shape,
+            m=jnp.mean(g),
+            mi=jnp.min(g),
+            ma=jnp.max(g),
+        )
+        return (g,)
+
+    _probe.defvjp(_probe_fwd, _probe_bwd)
+
+    return _probe(x)
+
+
+# 1. Safe L2 Normalization
+def normalize(x, mask=None, eps=1e-8):
+    """
+    Safe normalization that avoids NaN gradients for zero vectors/masked positions.
+    Crucial for JAX static shapes where padding vectors might be zeros.
+    """
+    # x shape: [..., H]
+    # mask shape: [..., 1]
+
+    # Handle NaN/Inf in input just in case
+    x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = x.astype(jnp.float32)
+
+    if mask is not None:
+        # Create a safe vector (ones) for positions that are masked out (Padding).
+        # This prevents division by zero (norm=0) in rsqrt.
+        # We restore the zero-ness later by multiplying by mask at the end.
+        x_safe = jnp.where(mask > 0, x, 1.0)
+
+        sq_sum = jnp.sum(x_safe**2, axis=-1, keepdims=True)
+        inv_norm = jax.lax.rsqrt(jnp.maximum(sq_sum, eps))
+
+        # Result is normalized vector where valid, 0.0 where masked
+        # This ensures padding vectors are explicitly zeroed out and don't affect dot products.
+        return (x_safe * inv_norm) * mask
+    else:
+        sq_sum = jnp.sum(x**2, axis=-1, keepdims=True)
+        inv_norm = jax.lax.rsqrt(jnp.maximum(sq_sum, eps))
+        return x * inv_norm
+
+
+def _compute_metrics(
+    logits, pos_sim, all_neg_sim, all_neg_mask_flat, sample_valid_flat, valid_count
+):
+    """
+    Compute debugging metrics ignoring padding.
+    """
+    # Accuracy: position 0 is the positive sample
+    pred_ids = jnp.argmax(logits, axis=-1)
+    # Mask out padding samples from accuracy calculation
+    accuracy = (
+        jnp.sum((pred_ids == 0).astype(jnp.float32) * sample_valid_flat) / valid_count
+    )
+
+    # Positive Similarity Stats
+    # pos_sim shape: [N, 1]
+    pos_sim_val = pos_sim.squeeze(-1) * sample_valid_flat
+    pos_sim_mean = jnp.sum(pos_sim_val) / valid_count
+
+    # Negative Similarity Stats
+    # all_neg_sim shape: [N, Total_Negs]
+    # We only care about valid anchors vs valid negatives
+    # Valid interactions = (Anchor is valid) AND (Negative is valid)
+
+    # Broadcast anchor mask to interaction matrix: [N, 1] * [1, Total_Negs] -> [N, Total_Negs]
+    valid_interactions_mask = sample_valid_flat[:, None] * all_neg_mask_flat[None, :]
+    total_valid_interactions = jnp.sum(valid_interactions_mask) + 1e-8
+
+    neg_sim_val = all_neg_sim * valid_interactions_mask
+    neg_sim_mean = jnp.sum(neg_sim_val) / total_valid_interactions
+
+    return {
+        "accuracy": accuracy,
+        "valid_samples": valid_count,
+        "pos_sim_mean": pos_sim_mean,
+        "neg_sim_mean": neg_sim_mean,
+    }
+
+
 def info_nce_loss(
-    anchor_emb: jnp.ndarray,  # [B, PackedSamples, H]
-    positive_emb: jnp.ndarray,  # [B, PackedSamples, H]
-    negatives_emb: jnp.ndarray,  # [B, PackedSamples, Num_Negs, H]
-    anchor_mask: jnp.ndarray,  # [B, PackedSamples]
-    pos_mask: jnp.ndarray,  # [B, PackedSamples]
-    negs_mask: jnp.ndarray,  # [B, PackedSamples, Num_Negs]
+    anchor_emb: jnp.ndarray,  # [B, S, H] (S is static MaxSamples)
+    positive_emb: jnp.ndarray,  # [B, S, H]
+    negatives_emb: jnp.ndarray,  # [B, S, Num_Negs, H]
+    anchor_mask: jnp.ndarray,  # [B, S] (1 for valid, 0 for padding)
+    pos_mask: jnp.ndarray,  # [B, S]
+    negs_mask: jnp.ndarray,  # [B, S, Num_Negs]
     temperature: float = 0.07,
     return_metrics: bool = False,
 ) -> Tuple[jnp.ndarray, Dict]:
     """
-    InfoNCE Loss with in-batch negatives.
-    Masked positions (mask=0) do not participate in forward and backward pass.
-    Uses all batch negatives: each anchor's negatives include its own negatives
-    plus all other samples' positives in the batch (as in-batch negatives).
+    InfoNCE Loss with in-batch negatives and Static Shape Support (JAX).
+
+    JAX Static Shape Handling:
+    - 'S' is the static dimension (Max Packed Samples).
+    - Masks (anchor_mask, pos_mask) determine actual valid data.
+    - Masks input shape: Can be [B, S] or [B, S, 1]. The function normalizes them to handle both.
+    - Code logic explicitly handles padding:
+        1. Padding vectors are normalized to exact Zeros.
+        2. Padding negatives are masked in logits (-1e9) so valid anchors ignore them.
+        3. Loss is only averaged over valid anchors (sample_valid_flat).
+
+    Logic:
+    1. Flatten Batch (B) and MaxSamples (S) dimensions into N = B*S.
+    2. Compute similarity between Anchor[i] and Positive[i].
+    3. Compute similarity between Anchor[i] and ALL Negatives flattened (Num_Negs * N).
 
     Args:
-        anchor_emb: Anchor embeddings [B, PackedSamples, H]
-        positive_emb: Positive embeddings [B, PackedSamples, H]
-        negatives_emb: Negative embeddings [B, PackedSamples, Num_Negs, H]
-        anchor_mask: Anchor mask, 1 for valid, 0 for invalid [B, PackedSamples]
-        pos_mask: Positive mask, 1 for valid, 0 for invalid [B, PackedSamples]
-        negs_mask: Negative mask, 1 for valid, 0 for invalid [B, PackedSamples, Num_Negs]
-        temperature: Temperature parameter for softmax
-        return_metrics: Whether to return additional metrics
+        anchor_emb: [B, S, H].
+        positive_emb: [B, S, H].
+        negatives_emb: [B, S, K, H]. K is Num_Negs per anchor.
+        anchor_mask: [B, S] or [B, S, 1].
+        pos_mask: [B, S] or [B, S, 1].
+        negs_mask: [B, S, K] or [B, S, K, 1]. Must be 0 for padding negatives.
+        temperature: Softmax temperature.
+        return_metrics: If True, returns a dictionary of metrics.
 
     Returns:
-        Tuple of (loss, metrics_dict)
+        loss: Scalar loss value.
+        metrics: Dictionary of metrics if requested.
     """
-    # 1. Determine valid samples: both anchor and positive must be valid (mask > 0)
-    # [B, PackedSamples] - boolean mask
-    sample_valid_mask = (anchor_mask > 0) & (pos_mask > 0)
-    # Convert to float32 for computation, sum to get valid count
-    sample_valid_mask_f32 = sample_valid_mask.astype(jnp.float32)
-    valid_count = jnp.sum(sample_valid_mask_f32) + 1e-8
+    # --- DEBUG Backward Gradients ---
+    # anchor_emb = inspect_grad(anchor_emb, "anchor_emb")
+    # positive_emb = inspect_grad(positive_emb, "anchor_emb")
+    # negatives_emb = inspect_grad(negatives_emb, "anchor_emb")
 
-    # 2. L2 Normalization
-    def normalize(x, eps=1e-8):
-        """
-        Normalize embeddings.
-        """
-        # Convert to float32 for numerical stability
-        x = x.astype(jnp.float32)
+    # --- 1. Shape Standardization (Flattening B and S) ---
+    # Ensure inputs are at least 3D [B, S, ...] for uniform handling
+    if anchor_emb.ndim == 2:  # [S, H]
+        anchor_emb = anchor_emb[None, ...]
+        positive_emb = positive_emb[None, ...]
+        negatives_emb = negatives_emb[None, ...]
+        anchor_mask = anchor_mask[None, ...]
+        pos_mask = pos_mask[None, ...]
+        negs_mask = negs_mask[None, ...]
 
-        # Handle NaN and Inf values: replace with 0.0
-        x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    B, S, H = anchor_emb.shape  # S is static MaxSamples
+    K = negatives_emb.shape[2]  # Num Negatives per sample
+    N = B * S  # Total static capacity (Max Total Anchors)
 
-        # Compute norm along last dimension
-        norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    # Flatten anchors/positives to [N, H]
+    anchor_flat = anchor_emb.reshape(N, H)
+    pos_flat = positive_emb.reshape(N, H)
 
-        # Normalize
-        normalized = x / (norm + eps)
+    # Flatten masks to [N, 1]
+    # This robustly handles both [B, S] and [B, S, 1] inputs
+    anchor_mask_flat = anchor_mask.reshape(N, 1)
+    pos_mask_flat = pos_mask.reshape(N, 1)
 
-        return normalized
+    # Flatten negatives to [Total_Negs_Pool, H] -> [N*K, H]
+    negs_flat = negatives_emb.reshape(N * K, H)
+    # Flatten neg masks to [Total_Negs_Pool, 1] -> [N*K] (squeeze last dim for convenience later)
+    # This robustly handles both [B, S, K] and [B, S, K, 1] inputs
+    negs_mask_flat = negs_mask.reshape(N * K)
 
-    # Normalize embeddings
-    anchor_norm = normalize(anchor_emb)  # [B, PackedSamples, H]
-    positive_norm = normalize(positive_emb)  # [B, PackedSamples, H]
-    negatives_norm = normalize(negatives_emb)  # [B, PackedSamples, Num_Negs, H]
-
-    # 3. Compute positive similarity
-    # [B, PackedSamples, H] * [B, PackedSamples, H] -> [B, PackedSamples]
-    pos_sim = jnp.sum(
-        anchor_norm * positive_norm, axis=-1, keepdims=True
-    )  # [B, PackedSamples, 1]
-
-    # Apply sample_valid_mask: invalid samples have zero similarity
-    # This ensures they don't contribute to loss or gradients
-    pos_sim = pos_sim * sample_valid_mask_f32[..., None]
-
-    # 4. Compute negative similarities
-    # 4.1. Own negatives: [B, PackedSamples, Num_Negs]
-    # [B, PackedSamples, 1, H] * [B, PackedSamples, Num_Negs, H] -> [B, PackedSamples, Num_Negs]
-    own_neg_sim = jnp.sum(anchor_norm[..., None, :] * negatives_norm, axis=-1)
-    # Apply masks: both sample_valid_mask and negs_mask
-    # Only valid samples and valid negatives contribute
-    own_neg_sim = (
-        own_neg_sim * sample_valid_mask_f32[..., None] * negs_mask.astype(jnp.float32)
+    # --- 2. Determine Valid Samples ---
+    # A sample is valid for loss calculation only if both Anchor and Positive are valid.
+    # Padding samples (where mask=0) will result in 0 here.
+    sample_valid_flat = (anchor_mask_flat.squeeze(-1) > 0) & (
+        pos_mask_flat.squeeze(-1) > 0
     )
+    sample_valid_flat = sample_valid_flat.astype(jnp.float32)  # [N]
+    valid_count = jnp.sum(sample_valid_flat) + 1e-8
 
-    # 4.2. In-batch negatives: use all other samples' positives as negatives
-    # Reshape for batch-wise computation: [B, PackedSamples, H] -> [B * PackedSamples, H]
-    B, S, H = anchor_norm.shape
-    anchor_flat = anchor_norm.reshape(B * S, H)  # [B*S, H]
-    positive_flat = positive_norm.reshape(B * S, H)  # [B*S, H]
-    sample_valid_flat = sample_valid_mask_f32.reshape(B * S)  # [B*S]
-    pos_mask_flat = pos_mask.reshape(B * S).astype(jnp.float32)  # [B*S]
+    # --- 3. Normalize ---
+    # Apply normalization. Critical: Padding vectors become exact 0 vectors.
+    anchor_norm = normalize(anchor_flat, anchor_mask_flat)  # [N, H]
+    positive_norm = normalize(pos_flat, pos_mask_flat)  # [N, H]
 
-    # Compute similarity matrix: [B*S, H] @ [H, B*S] -> [B*S, B*S]
-    # Each row i: similarity between anchor[i] and all positives
-    in_batch_neg_sim = jnp.dot(anchor_flat, positive_flat.T)  # [B*S, B*S]
+    # For negatives, we need the mask in shape [N*K, 1] for normalize
+    negs_norm = normalize(negs_flat, negs_mask_flat[:, None])  # [N*K, H]
 
-    # Create mask to exclude self (diagonal) and invalid samples
-    # Self-exclusion mask: [B*S, B*S], diagonal is 0 (exclude self)
-    self_mask = 1.0 - jnp.eye(B * S, dtype=jnp.float32)
-    # Valid negative mask: [B*S, B*S]
-    # Only valid anchors (sample_valid_flat) can have negatives
-    # Only valid positives (pos_mask_flat) can be used as negatives
-    valid_neg_mask = sample_valid_flat[:, None] * pos_mask_flat[None, :]
-    # Combined mask: exclude self and invalid samples
-    in_batch_mask = self_mask * valid_neg_mask
-    # Apply mask: invalid positions become zero (no gradient)
-    in_batch_neg_sim = in_batch_neg_sim * in_batch_mask
+    # --- 4. Compute Similarities ---
 
-    # Reshape back: [B*S, B*S] -> [B, S, B*S]
-    in_batch_neg_sim = in_batch_neg_sim.reshape(B, S, B * S)
-    in_batch_mask_reshaped = in_batch_mask.reshape(B, S, B * S)
+    # A. Positive Similarity: Dot product of corresponding pairs
+    # [N, H] * [N, H] -> [N, 1]
+    # For padding samples, this dot product is 0.0 because vectors are 0.0
+    pos_sim = jnp.sum(anchor_norm * positive_norm, axis=-1, keepdims=True)
 
-    # 5. Concatenate all negatives: own negatives + in-batch negatives
-    # own_neg_sim: [B, S, Num_Negs], in_batch_neg_sim: [B, S, B*S]
-    all_neg_sim = jnp.concatenate(
-        [own_neg_sim, in_batch_neg_sim], axis=-1
-    )  # [B, S, Num_Negs + B*S]
+    # B. Negative Similarity: All Anchors vs All Negatives in the batch
+    # [N, H] @ [H, N*K] -> [N, N*K]
+    # For padding anchors (row i), the whole row is 0.0.
+    # For padding negatives (col j), the whole col is 0.0.
+    all_neg_sim = jnp.matmul(anchor_norm, negs_norm.T)
 
-    # Create combined mask for all negatives
-    # own_neg_mask: [B, S, Num_Negs], in_batch_mask: [B, S, B*S]
-    all_neg_mask = jnp.concatenate(
-        [negs_mask.astype(jnp.float32), in_batch_mask_reshaped], axis=-1
-    )  # [B, S, Num_Negs + B*S]
-    # Also apply sample_valid_mask: invalid samples don't have valid negatives
-    all_neg_mask = all_neg_mask * sample_valid_mask_f32[..., None]
+    # --- 5. Masking and Logits ---
 
-    # 6. Build logits: [B, PackedSamples, 1 + Num_Negs + B*S]
-    # Index 0 is positive, indices 1..(Num_Negs+B*S) are negatives
-    logits = jnp.concatenate(
-        [pos_sim, all_neg_sim], axis=-1
-    )  # [B, S, 1 + Num_Negs + B*S]
+    # Masking Invalid Negatives (Padding in the negative pool):
+    # If a negative sample is padding, no anchor should consider it a negative.
+    # negs_mask_flat is [N*K]. Broadcast to [1, N*K].
+    neg_validity_mask = negs_mask_flat[None, :]
+
+    # Replace similarity 0.0 (from padding) with -1e9 to remove from Softmax
+    all_neg_sim = jnp.where(neg_validity_mask > 0, all_neg_sim, -1e9)
+
+    # Concatenate: [Positive_Sim, All_Negative_Sims] -> [N, 1 + N*K]
+    # Index 0 is always the positive class
+    logits = jnp.concatenate([pos_sim, all_neg_sim], axis=-1)
+
+    # Apply Temperature
     logits = logits / temperature
 
-    # 7. Apply mask to logits (set invalid positions to -inf)
-    # This ensures masked positions don't contribute to softmax
-    combined_mask = jnp.concatenate(
-        [sample_valid_mask_f32[..., None], all_neg_mask], axis=-1
-    )  # [B, S, 1 + Num_Negs + B*S]
-    large_neg = -1e9  # Large negative value, safe for softmax
-    logits = jnp.where(combined_mask > 0, logits, large_neg)
+    # --- 6. Compute Loss ---
+    # Target is always index 0 (the positive pair)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
 
-    # 8. Compute Cross Entropy Loss
-    # Target is always 0 (positive is at index 0)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [B, S, 1 + Num_Negs + B*S]
-    pos_log_prob = log_probs[..., 0]  # [B, S]
+    # Gather log_prob of the positive class (index 0)
+    pos_log_prob = log_probs[..., 0]  # [N]
 
-    # Loss = -log(P(Positive))
-    per_sample_loss = -pos_log_prob
+    # Apply Mask to Loss:
+    # 1. Padding Anchors: sample_valid_flat is 0 -> adds 0.0 to loss sum.
+    # 2. Valid Anchors: sample_valid_flat is 1 -> adds correct loss.
+    loss = jnp.sum(-pos_log_prob * sample_valid_flat) / valid_count
 
-    # Apply sample_valid_mask: invalid samples have zero loss and no gradient
-    # This is critical: masked positions don't contribute to loss or gradients
-    masked_loss = per_sample_loss * sample_valid_mask_f32
-    loss = jnp.sum(masked_loss) / valid_count
+    # --- Debug Forward ---
+    # jax.debug.print("loss: {}", loss)
 
     if return_metrics:
-        # 9. Compute metrics
-        # Accuracy: whether the max logit is at index 0 (positive)
-        pred_ids = jnp.argmax(logits, axis=-1)  # [B, S]
-        correct = (pred_ids == 0).astype(jnp.float32) * sample_valid_mask_f32
-        accuracy = jnp.sum(correct) / valid_count
-
-        # Positive similarity statistics (only valid samples)
-        pos_sim_flat = pos_sim.flatten()  # [B*S]
-        sample_valid_flat_metrics = sample_valid_mask_f32.flatten()  # [B*S]
-        pos_sim_valid = pos_sim_flat * sample_valid_flat_metrics
-        pos_sim_mean = jnp.sum(pos_sim_valid) / valid_count
-
-        pos_sim_squared_diff = (
-            pos_sim_valid - pos_sim_mean
-        ) ** 2 * sample_valid_flat_metrics
-        pos_sim_variance = jnp.sum(pos_sim_squared_diff) / valid_count
-        pos_sim_std = jnp.sqrt(pos_sim_variance + 1e-8)
-
-        # Negative similarity statistics (own negatives + in-batch negatives)
-        # Only count valid negatives
-        neg_valid_mask_combined = all_neg_mask  # [B, S, Num_Negs + B*S]
-        neg_valid_count = jnp.sum(neg_valid_mask_combined) + 1e-8
-
-        neg_sim_valid = all_neg_sim * neg_valid_mask_combined
-        neg_sim_mean = jnp.sum(neg_sim_valid) / neg_valid_count
-
-        neg_sim_squared_diff = (
-            neg_sim_valid - neg_sim_mean
-        ) ** 2 * neg_valid_mask_combined
-        neg_sim_variance = jnp.sum(neg_sim_squared_diff) / neg_valid_count
-        neg_sim_std = jnp.sqrt(neg_sim_variance + 1e-8)
-
-        metrics = {
-            "accuracy": accuracy,
-            "valid_samples": valid_count,
-            "pos_sim_mean": pos_sim_mean,
-            "neg_sim_mean": neg_sim_mean,
-            "pos_sim_std": pos_sim_std,
-            "neg_sim_std": neg_sim_std,
-        }
-
+        metrics = _compute_metrics(
+            logits, pos_sim, all_neg_sim, negs_mask_flat, sample_valid_flat, valid_count
+        )
         return loss, metrics
-
-    return loss, {}
+    else:
+        return loss, {}
