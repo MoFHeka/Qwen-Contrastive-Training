@@ -84,7 +84,20 @@ def initialize_model(
         print(f"✓ 模型已存在: {save_path}")
         return save_path
 
-    print(f"\n[1/2] 创建模型从: {initial_model}")
+    # 1. 加载 tokenizer
+    print(f"\n[1/3] 加载 tokenizer 从: {initial_model}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(initial_model, trust_remote_code=True)
+        print("✓ Tokenizer 加载成功")
+    except Exception as e:
+        print(f"✗ Tokenizer 加载失败: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+    # 2. 创建模型
+    print(f"\n[2/3] 创建模型从: {initial_model}")
     try:
         model = create_from_initial_model(
             initial_model=initial_model,
@@ -101,8 +114,10 @@ def initialize_model(
         traceback.print_exc()
         raise
 
-    print(f"\n[2/2] 保存模型到: {save_path}")
+    # 3. 保存模型和 tokenizer
+    print(f"\n[3/3] 保存模型和 tokenizer 到: {save_path}")
     try:
+        # 保存模型
         save_easydel_model(
             model=model,
             save_path=save_path,
@@ -113,15 +128,20 @@ def initialize_model(
             dtype=dtype,
         )
         print("✓ 模型保存成功")
+
+        # 保存 tokenizer 到单独的子文件夹
+        tokenizer_path = os.path.join(save_path, "tokenizer")
+        tokenizer.save_pretrained(tokenizer_path)
+        print(f"✓ Tokenizer 保存成功: {tokenizer_path}")
     except Exception as e:
-        print(f"✗ 模型保存失败: {e}")
+        print(f"✗ 保存失败: {e}")
         import traceback
 
         traceback.print_exc()
         raise
 
     print("\n" + "=" * 80)
-    print("模型初始化完成!")
+    print("模型和 Tokenizer 初始化完成!")
     print("=" * 80)
     return save_path
 
