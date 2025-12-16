@@ -185,8 +185,8 @@ class ContrastiveInputTransform(Transform):
 
         negative_tokens = []
         negative_triplet_types = []
-        if self.num_negative_samples_per_anchor == 1:
-            negative = [negative[0]]
+        if type(negative[0]) is str:
+            negative = [negative]
         assert len(negative) == self.num_negative_samples_per_anchor
         for i, negative_sample in enumerate(negative):
             negative_tokens_sample, negative_triplet_types_sample = (
