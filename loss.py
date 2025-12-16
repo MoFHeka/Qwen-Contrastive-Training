@@ -114,7 +114,7 @@ def info_nce_loss(
     anchor_mask: jnp.ndarray,  # [B, S] (1 for valid, 0 for padding)
     pos_mask: jnp.ndarray,  # [B, S]
     negs_mask: jnp.ndarray,  # [B, S, Num_Negs]
-    temperature: float = 0.07,
+    temperature: float = 1,
     return_metrics: bool = False,
 ) -> Tuple[jnp.ndarray, Dict]:
     """
@@ -192,25 +192,34 @@ def info_nce_loss(
     valid_count = jnp.sum(sample_valid_flat) + 1e-8
 
     # --- 3. Normalize ---
-    # Apply normalization. Critical: Padding vectors become exact 0 vectors.
-    anchor_norm = normalize(anchor_flat, anchor_mask_flat)  # [N, H]
-    positive_norm = normalize(pos_flat, pos_mask_flat)  # [N, H]
+    # # Apply normalization. Critical: Padding vectors become exact 0 vectors.
+    # anchor_norm = normalize(anchor_flat, anchor_mask_flat)  # [N, H]
+    # positive_norm = normalize(pos_flat, pos_mask_flat)  # [N, H]
 
-    # For negatives, we need the mask in shape [N*K, 1] for normalize
-    negs_norm = normalize(negs_flat, negs_mask_flat[:, None])  # [N*K, H]
+    # # For negatives, we need the mask in shape [N*K, 1] for normalize
+    # negs_norm = normalize(negs_flat, negs_mask_flat[:, None])  # [N*K, H]
+
+    # Since the representations during language model training are anisotropic, normalization cannot be used.
+    anchor_norm = anchor_flat * anchor_mask_flat
+    positive_norm = pos_flat * pos_mask_flat
+    negs_norm = negs_flat * negs_mask_flat[:, None]
 
     # --- 4. Compute Similarities ---
+    # Don't let the model learn to simply lengthen the modulus of the vector
+    scale_factor = 1.0 / jnp.sqrt(H)
 
     # A. Positive Similarity: Dot product of corresponding pairs
     # [N, H] * [N, H] -> [N, 1]
     # For padding samples, this dot product is 0.0 because vectors are 0.0
-    pos_sim = jnp.sum(anchor_norm * positive_norm, axis=-1, keepdims=True)
+    pos_sim = (
+        jnp.sum(anchor_norm * positive_norm, axis=-1, keepdims=True) * scale_factor
+    )
 
     # B. Negative Similarity: All Anchors vs All Negatives in the batch
     # [N, H] @ [H, N*K] -> [N, N*K]
     # For padding anchors (row i), the whole row is 0.0.
     # For padding negatives (col j), the whole col is 0.0.
-    all_neg_sim = jnp.matmul(anchor_norm, negs_norm.T)
+    all_neg_sim = jnp.matmul(anchor_norm, negs_norm.T) * scale_factor
 
     # --- 5. Masking and Logits ---
 
@@ -231,7 +240,7 @@ def info_nce_loss(
 
     # --- 6. Compute Loss ---
     # Target is always index 0 (the positive pair)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
 
     # Gather log_prob of the positive class (index 0)
     pos_log_prob = log_probs[..., 0]  # [N]

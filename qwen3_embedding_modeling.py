@@ -54,7 +54,7 @@ class ProjectionHead(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype=jnp.float32,
         use_bias=True,
-        kernel_init=nnx.initializers.lecun_normal(),
+        kernel_init=nnx.initializers.orthogonal(scale=1.0),
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nnx.Rngs,
@@ -300,8 +300,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 chex.assert_rank(triplet_type, {1})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {1})
-            else:
-                attention_mask = jnp.ones_like(input_ids)
             if position_ids is not None:
                 chex.assert_rank(position_ids, {1})
         elif input_ids.ndim == 2:
@@ -313,8 +311,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 chex.assert_rank(triplet_type, {2})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {2})
-            else:
-                attention_mask = jnp.ones_like(input_ids)
             if position_ids is not None:
                 chex.assert_rank(position_ids, {2})
         else:
@@ -322,12 +318,17 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
         # All computations within the same mesh for distributed training
         # EasyDeL models are designed for SPMD (jit + Mesh), not pmap
-        mask_info = MaskInfo.from_segments(
-            q_segment_ids=segment_ids,
-            kv_segment_ids=segment_ids,
-            q_positions=position_ids,
-            kv_positions=position_ids,
-        )
+        if segment_ids is not None and position_ids is not None:
+            mask_info = MaskInfo.from_segments(
+                q_segment_ids=segment_ids,
+                kv_segment_ids=segment_ids,
+                q_positions=position_ids,
+                kv_positions=position_ids,
+            )
+        elif segment_ids is not None:
+            mask_info = MaskInfo.from_segments(segment_ids)
+        elif attention_mask is not None:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
 
         # Forward through base model
         base_outputs = self.base_model(
@@ -360,13 +361,15 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 hidden_states=last_hidden_state,
                 segment_ids=segment_ids,
                 triplet_type=triplet_type,
-                attention_mask=attention_mask,
+                q_attention_mask=mask_info.q_attention_mask,
                 max_samples=max_samples,
                 num_negatives=num_negatives,
             )
 
             # 2. 投影 (一次性投影所有向量，效率最高)
             projected_embs = self.projection(combined_embs)
+            # 3. 应用 slot_mask, 清除bias影响
+            projected_embs = projected_embs * slot_mask[..., None]
         else:
             # Standard forward pass without triplet extraction
             # Only take the last token hidden state
@@ -420,8 +423,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         """
         # Extract contrastive learning parameters from loss_kwargs or use defaults
         loss_kwargs = loss_kwargs or {}
-        temperature = loss_kwargs.get("temperature", 0.07)
-        max_samples = loss_kwargs.get("max_samples", 64)
+        temperature = loss_kwargs.get("temperature", 1)
+        max_samples = loss_kwargs.get("max_samples", 1)
         num_negatives = loss_kwargs.get("num_negatives", 1)
         compute_loss_metrics = loss_kwargs.get("compute_loss_metrics", False)
 
@@ -516,7 +519,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         hidden_states: jax.Array,  # [B, Seq, H]
         segment_ids: jax.Array,  # [B, Seq]
         triplet_type: jax.Array,  # [B, Seq] (0=A, 1=P, 2=N1, 3=N2...)
-        attention_mask: jax.Array,  # [B, Seq]
+        q_attention_mask: jax.Array,  # [B, Seq]
         max_samples: int = 64,
         num_negatives: int = 1,  # 负样本数量
     ):
@@ -530,35 +533,32 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         if hs_ndim == 2:
             chex.assert_rank(segment_ids, 1)
             chex.assert_rank(triplet_type, 1)
-            chex.assert_rank(attention_mask, 1)
+            chex.assert_rank(q_attention_mask, 1)
         elif hs_ndim == 3:
             chex.assert_rank(segment_ids, 2)
             chex.assert_rank(triplet_type, 2)
-            chex.assert_rank(attention_mask, 2)
+            chex.assert_rank(q_attention_mask, 2)
         else:
             raise ValueError(f"Unexpected hidden_states dimension: {hs_ndim}")
-
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(segment_ids)
 
         # --- 核心逻辑 (vmap 自动处理 Batch) ---
         def _process_single_batch(h_states, s_ids, s_types, mask):
             seq_len = s_ids.shape[0]
 
             # # A. 确定有效 Token
-            # # 主要依赖 attention_mask 来过滤 padding (mask=0)
+            # # 主要依赖 q_attention_mask 来过滤 padding (mask=0)
             # # 同时过滤非法 Type (<0)
             # is_valid_token = (mask > 0) & (s_types >= 0)
             #
             # # B. 边界检查
             # # 确保 Sample ID 和 Type ID 在预设范围内
             # # Padding positions use segment_id = max(actual_segment_ids) + 1,
-            # # which will be >= max_samples in most cases, but we rely on attention_mask for filtering
+            # # which will be >= max_samples in most cases, but we rely on q_attention_mask for filtering
             # in_bounds = (s_ids < max_samples) & (s_types < num_slots)
             #
             # total_valid_mask = is_valid_token & in_bounds
 
-            # A + B. 快速路径，只用 attention_mask 来过滤 padding
+            # A + B. 快速路径，只用 q_attention_mask 来过滤 padding
             total_valid_mask = mask
 
             # C. 计算 Scatter Index (扁平化索引)
@@ -624,11 +624,11 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
         if hs_ndim == 2:
             return _process_single_batch(
-                hidden_states, segment_ids, triplet_type, attention_mask
+                hidden_states, segment_ids, triplet_type, q_attention_mask
             )
         elif hs_ndim == 3:
             return jax.vmap(_process_single_batch)(
-                hidden_states, segment_ids, triplet_type, attention_mask
+                hidden_states, segment_ids, triplet_type, q_attention_mask
             )
         else:
             raise ValueError(f"Unexpected hidden_states dimension: {hs_ndim}")
