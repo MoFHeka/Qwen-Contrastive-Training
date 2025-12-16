@@ -118,8 +118,11 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             temp_triplet_type_buffer + [-1] * pad_len, dtype=np.int32
         )
 
-        # 3. Segment IDs: All tokens belong to segment 0, padding uses 1
-        segment_ids = np.array(temp_sample_index_buffer + [1] * pad_len, dtype=np.int32)
+        # 3. Segment IDs: All tokens belong to segment 0, padding uses -1
+        # Following MaskInfo convention: -1 for padding tokens
+        segment_ids = np.array(
+            temp_sample_index_buffer + [-1] * pad_len, dtype=np.int32
+        )
 
         # 4. Attention Mask
         attention_mask = np.array([1] * current_len + [0] * pad_len, dtype=np.int32)
@@ -250,16 +253,13 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
 
         # 3. Segment IDs: Indicates which sample each token belongs to
         # All tokens in a segment (anchor, positive, negatives) have the same segment_id
-        # Pad with max(segment_ids) + 1 to indicate padding positions
-        # This ensures padding is always greater than any valid segment_id
-        if self._sample_index_buffer:
-            max_segment_id = max(self._sample_index_buffer)
-            pad_segment_id = max_segment_id + 1
-        else:
-            # Edge case: empty buffer (should not happen, but handle gracefully)
-            pad_segment_id = self.max_samples
+        # Pad with -1 to indicate padding positions (following MaskInfo convention)
+        # According to MaskInfo.from_segments documentation:
+        # https://github.com/erfanzar/ejkernel/blob/d0c6af1ee534aa4dddce8abaeb04a661b602cf3b/ejkernel/types/mask.py#L677
+        #   - Non-negative integers: segment membership (0, 1, 2, ...)
+        #   - -1: padding tokens
         segment_ids = np.array(
-            self._sample_index_buffer + [pad_segment_id] * pad_len, dtype=np.int32
+            self._sample_index_buffer + [-1] * pad_len, dtype=np.int32
         )
 
         # 4. Attention Mask: 1D mask indicating valid (non-padding) positions

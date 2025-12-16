@@ -298,6 +298,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 chex.assert_rank(triplet_type, {1})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {1})
+            if position_ids is not None:
+                chex.assert_rank(position_ids, {1})
         elif input_ids.ndim == 2:
             if segment_ids is not None:
                 chex.assert_rank(segment_ids, {2})
@@ -305,6 +307,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 chex.assert_rank(triplet_type, {2})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {2})
+            if position_ids is not None:
+                chex.assert_rank(position_ids, {2})
         else:
             raise ValueError(f"Unexpected input_ids dimension: {input_ids.ndim}")
 
@@ -330,6 +334,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             input_ids=input_ids,
             attention_mask=None,
             mask_info=mask_info,
+            position_ids=position_ids,
             output_hidden_states=True,  # Always get hidden states for extraction
             **kwargs,
         )

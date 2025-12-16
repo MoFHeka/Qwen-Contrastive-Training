@@ -269,9 +269,9 @@ def train_model(
             total_batch_size=num_devices * batch_size,
             max_training_steps=max_steps,
             max_sequence_length=seq_length,
-            save_steps=1024,
-            log_steps=4,
-            report_steps=4,
+            save_steps=1000,
+            log_steps=10,
+            report_steps=10,
             use_wandb=False,
             report_metrics=True,
             optimizer="muon",
@@ -282,7 +282,7 @@ def train_model(
             save_directory=output_dir,
             resume_if_possible=False,
             gradient_accumulation_steps=num_gradient_accumulation_steps,
-            performance_mode=True,
+            performance_mode=False,
             verbose=True,
         )
         print("✓ 训练参数配置成功")
