@@ -494,7 +494,8 @@ def test_max_samples():
                             seq_segment_ids = segment_ids[i]
                             seq_info = extract_sample_info_from_segment_ids(
                                 seq_segment_ids,
-                                attention_mask[i]
+                                num_slots=3,  # 2 + 1 (num_negatives), default value
+                                attention_mask=attention_mask[i]
                                 if attention_mask is not None
                                 else None,
                             )
@@ -514,7 +515,11 @@ def test_max_samples():
                                 return False
                     else:
                         # 1D: 单个序列
-                        seq_info = extract_sample_info_from_segment_ids(segment_ids)
+                        seq_info = extract_sample_info_from_segment_ids(
+                            segment_ids,
+                            num_slots=3,
+                            attention_mask=None,  # 2 + 1 (num_negatives), default value
+                        )
                         max_samples_per_sequence = max(
                             max_samples_per_sequence, seq_info.num_samples
                         )

@@ -101,18 +101,26 @@ def create_test_data(
     return output_file
 
 
-def verify_segment_ids(segment_ids: np.ndarray, sample_info, verbose: bool = False):
+def verify_segment_ids(
+    segment_ids: np.ndarray,
+    sample_info,
+    num_negatives: int = 1,  # Number of negative samples per anchor-positive pair
+    verbose: bool = False,
+):
     """验证 segment_ids 正确标记了样本边界。
 
     Args:
-      segment_ids: Segment IDs 数组，可以是1D [seq_length] 或2D [batch_size, seq_length]
+      segment_ids: Segment IDs 数组，编码 sample_id * num_slots + triplet_type
+                  可以是1D [seq_length] 或2D [batch_size, seq_length]
       sample_info: 样本信息（如果是批次数据，包含所有packed sequences的聚合信息）
+      num_negatives: Number of negative samples per anchor-positive pair. Default: 1.
       verbose: 是否打印详细信息
 
     Returns:
       bool: 是否通过验证
     """
     errors = []
+    num_slots = 2 + num_negatives
 
     # 处理批次维度
     if segment_ids.ndim == 2:
@@ -126,36 +134,56 @@ def verify_segment_ids(segment_ids: np.ndarray, sample_info, verbose: bool = Fal
         total_verified_samples = 0
         for batch_idx in range(batch_size):
             seq_segment_ids = segment_ids[batch_idx]
-            seq_info = extract_sample_info_from_segment_ids(seq_segment_ids)
+            seq_info = extract_sample_info_from_segment_ids(
+                seq_segment_ids,
+                num_slots,
+                attention_mask=None,
+            )
 
             # 验证这个packed sequence
+            # segment_ids 现在编码为 sample_id * num_slots + triplet_type
+            # 同一样本内的 segment_id 可能不同（因为 triplet_type 不同），但 sample_id 应该相同
             for i, (start, length) in enumerate(
                 zip(seq_info.sample_starts, seq_info.sample_lengths)
             ):
                 end = start + length
                 sample_segments = seq_segment_ids[start:end]
 
-                # 同一样本内的 segment_id 应该相同
-                unique_segments = np.unique(sample_segments)
-                if len(unique_segments) > 1:
+                # 过滤掉 padding (-1)
+                valid_segments = sample_segments[sample_segments >= 0]
+                if len(valid_segments) == 0:
+                    continue
+
+                # 提取 sample_id: segment_id // num_slots
+                sample_ids = valid_segments // num_slots
+                unique_sample_ids = np.unique(sample_ids)
+
+                # 同一样本内的 sample_id 应该相同
+                if len(unique_sample_ids) > 1:
                     errors.append(
-                        f"批次 {batch_idx} 样本 {i} (位置 {start}-{end}) 内有多个 segment_id: {unique_segments}"
+                        f"批次 {batch_idx} 样本 {i} (位置 {start}-{end}) 内有多个 sample_id: {unique_sample_ids}"
                     )
 
-                # 相邻样本的 segment_id 应该不同（除了第一个）
+                # 相邻样本的 sample_id 应该不同
                 if i > 0:
                     prev_end = (
                         seq_info.sample_starts[i - 1] + seq_info.sample_lengths[i - 1]
                     )
-                    prev_segment = (
-                        seq_segment_ids[prev_end - 1] if prev_end > 0 else None
+                    prev_valid_segments = (
+                        seq_segment_ids[prev_end - 1] if prev_end > 0 else -1
                     )
-                    curr_segment = seq_segment_ids[start]
+                    curr_valid_segments = (
+                        seq_segment_ids[start] if start < len(seq_segment_ids) else -1
+                    )
 
-                    if prev_segment is not None and prev_segment == curr_segment:
-                        errors.append(
-                            f"批次 {batch_idx} 样本 {i - 1} 和样本 {i} 的 segment_id 相同: {prev_segment}"
-                        )
+                    if prev_valid_segments >= 0 and curr_valid_segments >= 0:
+                        prev_sample_id = prev_valid_segments // num_slots
+                        curr_sample_id = curr_valid_segments // num_slots
+
+                        if prev_sample_id == curr_sample_id:
+                            errors.append(
+                                f"批次 {batch_idx} 样本 {i - 1} 和样本 {i} 的 sample_id 相同: {prev_sample_id}"
+                            )
 
             total_verified_samples += seq_info.num_samples
 
@@ -172,32 +200,47 @@ def verify_segment_ids(segment_ids: np.ndarray, sample_info, verbose: bool = Fal
         return True
     else:
         # 1D数据：单个packed sequence
-        # 验证每个样本内的 segment_id 一致
+        # segment_ids 现在编码为 sample_id * num_slots + triplet_type
+        # 同一样本内的 segment_id 可能不同（因为 triplet_type 不同），但 sample_id 应该相同
         for i, (start, length) in enumerate(
             zip(sample_info.sample_starts, sample_info.sample_lengths)
         ):
             end = start + length
             sample_segments = segment_ids[start:end]
 
-            # 同一样本内的 segment_id 应该相同
-            unique_segments = np.unique(sample_segments)
-            if len(unique_segments) > 1:
+            # 过滤掉 padding (-1)
+            valid_segments = sample_segments[sample_segments >= 0]
+            if len(valid_segments) == 0:
+                continue
+
+            # 提取 sample_id: segment_id // num_slots
+            sample_ids = valid_segments // num_slots
+            unique_sample_ids = np.unique(sample_ids)
+
+            # 同一样本内的 sample_id 应该相同
+            if len(unique_sample_ids) > 1:
                 errors.append(
-                    f"样本 {i} (位置 {start}-{end}) 内有多个 segment_id: {unique_segments}"
+                    f"样本 {i} (位置 {start}-{end}) 内有多个 sample_id: {unique_sample_ids}"
                 )
 
-            # 相邻样本的 segment_id 应该不同（除了第一个）
+            # 相邻样本的 sample_id 应该不同
             if i > 0:
                 prev_end = (
                     sample_info.sample_starts[i - 1] + sample_info.sample_lengths[i - 1]
                 )
-                prev_segment = segment_ids[prev_end - 1] if prev_end > 0 else None
-                curr_segment = segment_ids[start]
+                prev_valid_segment = segment_ids[prev_end - 1] if prev_end > 0 else -1
+                curr_valid_segment = (
+                    segment_ids[start] if start < len(segment_ids) else -1
+                )
 
-                if prev_segment is not None and prev_segment == curr_segment:
-                    errors.append(
-                        f"样本 {i - 1} 和样本 {i} 的 segment_id 相同: {prev_segment}"
-                    )
+                if prev_valid_segment >= 0 and curr_valid_segment >= 0:
+                    prev_sample_id = prev_valid_segment // num_slots
+                    curr_sample_id = curr_valid_segment // num_slots
+
+                    if prev_sample_id == curr_sample_id:
+                        errors.append(
+                            f"样本 {i - 1} 和样本 {i} 的 sample_id 相同: {prev_sample_id}"
+                        )
 
         if errors:
             if verbose:
@@ -403,7 +446,11 @@ def verify_sample_boundaries(
         total_verified_samples = 0
         for batch_idx in range(batch_size):
             seq_segment_ids = segment_ids[batch_idx]
-            seq_info = extract_sample_info_from_segment_ids(seq_segment_ids)
+            seq_info = extract_sample_info_from_segment_ids(
+                seq_segment_ids,
+                num_slots=3,
+                attention_mask=None,  # 2 + 1 (num_negatives), default value
+            )
 
             # 验证这个packed sequence的样本边界
             for i in range(len(seq_info.sample_starts) - 1):
@@ -470,32 +517,34 @@ def verify_sample_boundaries(
 
 def verify_sample_reconstruction(
     input_ids: np.ndarray,
-    triplet_type: np.ndarray,
     segment_ids: np.ndarray,
     sample_info,
     tokenizer,
+    num_negatives: int = 1,
     verbose: bool = False,
 ):
     """验证能够正确拆分样本并提取各部分。
 
     Args:
       input_ids: Input IDs 数组
-      triplet_type: Segment type 数组
-      segment_ids: Segment IDs 数组
+      segment_ids: Segment IDs 数组，编码 sample_id * num_slots + triplet_type
       sample_info: 样本信息
       tokenizer: Tokenizer 用于解码验证
+      num_negatives: Number of negative samples per anchor-positive pair. Default: 1.
       verbose: 是否打印详细信息
 
     Returns:
       bool: 是否通过验证
     """
     errors = []
+    num_slots = 2 + num_negatives
 
     # 拆分样本
     samples = split_packed_sequence(
         jnp.array(input_ids),
         jnp.array(segment_ids) if segment_ids is not None else None,
         sample_info,
+        num_negatives=num_negatives,
     )
 
     if len(samples) != sample_info.num_samples:
@@ -515,29 +564,39 @@ def verify_sample_reconstruction(
             errors.append(f"样本 {i} 的 input_ids 不匹配")
             continue
 
-        # 验证能够提取 anchor/positive/negative（排除 special tokens，-1）
-        sample_triplet_type = triplet_type[sample_start : sample_start + sample_length]
+        # 从 segment_ids 中提取 triplet_type: segment_id % num_slots
+        if segment_ids is not None:
+            sample_segment_ids = segment_ids[
+                sample_start : sample_start + sample_length
+            ]
+            # 提取 triplet_type: segment_id % num_slots
+            sample_triplet_type = sample_segment_ids % num_slots
+            # 过滤掉 padding (-1 % num_slots 会得到负数，需要特殊处理)
+            valid_mask = sample_segment_ids >= 0
+            sample_triplet_type = np.where(valid_mask, sample_triplet_type, -1)
 
-        anchor_mask = sample_triplet_type == 0
-        positive_mask = sample_triplet_type == 1
-        negative_mask = sample_triplet_type == 2
-        # Note: special tokens are marked with -1 and should be excluded from content extraction
+            anchor_mask = sample_triplet_type == 0
+            positive_mask = sample_triplet_type == 1
+            negative_mask = (sample_triplet_type >= 2) & (
+                sample_triplet_type < num_slots
+            )
+            # Note: special tokens are marked with -1 and should be excluded from content extraction
 
-        if not np.any(anchor_mask):
-            errors.append(f"样本 {i} 缺少 anchor 部分")
-        if not np.any(positive_mask):
-            errors.append(f"样本 {i} 缺少 positive 部分")
-        if not np.any(negative_mask):
-            errors.append(f"样本 {i} 缺少 negative 部分")
+            if not np.any(anchor_mask):
+                errors.append(f"样本 {i} 缺少 anchor 部分")
+            if not np.any(positive_mask):
+                errors.append(f"样本 {i} 缺少 positive 部分")
+            if not np.any(negative_mask):
+                errors.append(f"样本 {i} 缺少 negative 部分")
 
-        # 验证各部分顺序：anchor -> positive -> negative
-        anchor_indices = np.where(anchor_mask)[0]
-        positive_indices = np.where(positive_mask)[0]
-        negative_indices = np.where(negative_mask)[0]
+            # 验证各部分顺序：anchor -> positive -> negative
+            anchor_indices = np.where(anchor_mask)[0]
+            positive_indices = np.where(positive_mask)[0]
+            negative_indices = np.where(negative_mask)[0]
 
-        if len(anchor_indices) > 0 and len(positive_indices) > 0:
-            if np.max(anchor_indices) >= np.min(positive_indices):
-                errors.append(f"样本 {i} anchor 和 positive 顺序错误")
+            if len(anchor_indices) > 0 and len(positive_indices) > 0:
+                if np.max(anchor_indices) >= np.min(positive_indices):
+                    errors.append(f"样本 {i} anchor 和 positive 顺序错误")
 
         if len(positive_indices) > 0 and len(negative_indices) > 0:
             if np.max(positive_indices) >= np.min(negative_indices):
@@ -687,7 +746,8 @@ def run_comprehensive_test(
             # 转换为 numpy
             input_ids = np.array(batch["input_ids"])
             segment_ids = np.array(batch.get("segment_ids"))
-            triplet_type = np.array(batch.get("triplet_type"))
+            # triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+            # triplet_type = np.array(batch.get("triplet_type"))  # No longer available
 
             # 提取样本信息
             sample_info = extract_sample_info(batch)
@@ -699,9 +759,7 @@ def run_comprehensive_test(
                 print(
                     f"    segment_ids 形状: {segment_ids.shape if segment_ids is not None else None}"
                 )
-                print(
-                    f"    triplet_type 形状: {triplet_type.shape if triplet_type is not None else None}"
-                )
+                # Note: triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
                 print(f"    包含样本数: {sample_info.num_samples}")
                 print(
                     f"    样本长度: {sample_info.sample_lengths[:5]}..."
@@ -712,33 +770,15 @@ def run_comprehensive_test(
             # 验证 segment_ids
             if segment_ids is not None:
                 if not verify_segment_ids(
-                    segment_ids, sample_info, verbose=verbose and batch_count <= 3
+                    segment_ids,
+                    sample_info,
+                    num_negatives=1,
+                    verbose=verbose and batch_count <= 3,
                 ):
                     all_passed = False
 
-            # 验证 triplet_type
-            if triplet_type is not None:
-                # 检查 triplet_type 的形状
-                if triplet_type.shape == ():
-                    print(f"  ✗ 批次 {batch_count}: triplet_type 是标量，应该是数组")
-                    all_passed = False
-                elif len(triplet_type) != len(input_ids):
-                    print(
-                        f"  ✗ 批次 {batch_count}: triplet_type 长度不匹配: {len(triplet_type)} != {len(input_ids)}"
-                    )
-                    all_passed = False
-                else:
-                    if not verify_triplet_type(
-                        triplet_type,
-                        input_ids,
-                        tokenizer,
-                        sample_info,
-                        verbose=verbose and batch_count <= 3,
-                    ):
-                        all_passed = False
-            else:
-                if verbose and batch_count <= 3:
-                    print(f"  ⚠ 批次 {batch_count}: triplet_type 缺失，跳过验证")
+            # Note: triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+            # No need to verify triplet_type separately
 
             # 验证样本边界
             if not verify_sample_boundaries(
@@ -747,15 +787,16 @@ def run_comprehensive_test(
                 all_passed = False
 
             # 验证样本重建（只对前几个批次进行详细验证，且只对1D数据验证）
-            if triplet_type is not None and batch_count <= 3:
+            # Note: triplet_type has been removed, we can extract it from segment_ids
+            if batch_count <= 3:
                 # 对于批次数据（2D），跳过详细验证，因为sample_info是聚合的
-                if triplet_type.ndim == 1 and input_ids.ndim == 1:
+                if input_ids.ndim == 1 and segment_ids is not None:
                     if not verify_sample_reconstruction(
                         input_ids,
-                        triplet_type,
                         segment_ids,
                         sample_info,
                         tokenizer,
+                        num_negatives=1,  # Default value
                         verbose=verbose,
                     ):
                         all_passed = False
@@ -807,7 +848,12 @@ def run_comprehensive_test(
     try:
         # 测试 extract_sample_info_from_segment_ids
         test_segment_ids = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
-        test_info = extract_sample_info_from_segment_ids(test_segment_ids)
+        # Note: This test uses old format segment_ids (direct sample_id encoding)
+        # For new format, segment_ids encode sample_id * num_slots + triplet_type
+        # Using num_slots=1 to match old behavior (each segment_id change is a new sample)
+        test_info = extract_sample_info_from_segment_ids(
+            test_segment_ids, num_slots=1, attention_mask=None
+        )
 
         if test_info.num_samples != 3:
             print(
@@ -938,19 +984,19 @@ def run_large_scale_test(
             # 基本验证（只对前几个批次进行详细验证）
             if batch_count <= 3:
                 segment_ids = np.array(batch.get("segment_ids"))
-                triplet_type = np.array(batch.get("triplet_type"))
+                # triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+                # triplet_type = np.array(batch.get("triplet_type"))  # No longer available
 
                 if segment_ids is not None:
-                    if not verify_segment_ids(segment_ids, sample_info, verbose=False):
+                    if not verify_segment_ids(
+                        segment_ids, sample_info, num_negatives=1, verbose=False
+                    ):
                         print(f"  ✗ 批次 {batch_count}: segment_ids 验证失败")
                         all_passed = False
 
-                if triplet_type is not None and len(triplet_type) == len(input_ids):
-                    if not verify_triplet_type(
-                        triplet_type, input_ids, tokenizer, sample_info, verbose=False
-                    ):
-                        print(f"  ✗ 批次 {batch_count}: triplet_type 验证失败")
-                        all_passed = False
+                # Note: triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+                # We can extract triplet_type from segment_ids if needed: triplet_type = segment_ids % num_slots
+                # No need to verify triplet_type separately
 
         elapsed_time = time.time() - start_time
 
@@ -1114,10 +1160,10 @@ def run_distributed_test(
             for batch in dataset:
                 batch_count += 1
 
-                input_ids = np.array(batch["input_ids"])
                 segment_ids = np.array(batch.get("segment_ids"))
-                triplet_type = np.array(batch.get("triplet_type"))
-                sample_info = extract_sample_info(batch)
+                # triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+                # triplet_type = np.array(batch.get("triplet_type"))  # No longer available
+                sample_info = extract_sample_info(batch, num_negatives=1)
                 total_samples_processed += sample_info.num_samples
 
                 # 每50个批次打印一次进度
@@ -1132,21 +1178,13 @@ def run_distributed_test(
                 if batch_count <= 3:
                     if segment_ids is not None:
                         if not verify_segment_ids(
-                            segment_ids, sample_info, verbose=False
+                            segment_ids, sample_info, num_negatives=1, verbose=False
                         ):
                             print(f"  ✗ 批次 {batch_count}: segment_ids 验证失败")
                             all_passed = False
 
-                    if triplet_type is not None and len(triplet_type) == len(input_ids):
-                        if not verify_triplet_type(
-                            triplet_type,
-                            input_ids,
-                            tokenizer,
-                            sample_info,
-                            verbose=False,
-                        ):
-                            print(f"  ✗ 批次 {batch_count}: triplet_type 验证失败")
-                            all_passed = False
+                    # Note: triplet_type has been removed, segment_ids now encode sample_id * num_slots + triplet_type
+                    # We can extract triplet_type from segment_ids if needed: triplet_type = segment_ids % num_slots
 
             elapsed_time = time.time() - start_time
 

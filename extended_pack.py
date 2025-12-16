@@ -32,14 +32,11 @@ logger = get_logger(__name__)
 class ContrastivePackedSequence(PackedSequence):
     """Extended PackedSequence containing contrastive learning specific fields."""
 
-    triplet_type: np.ndarray | None = None
     position_ids: np.ndarray | None = None
 
     def to_dict(self) -> dict[str, np.ndarray]:
         """Convert to dictionary for training."""
         result = super().to_dict()
-        if self.triplet_type is not None:
-            result["triplet_type"] = self.triplet_type
         if self.position_ids is not None:
             result["position_ids"] = self.position_ids
         return result
@@ -54,7 +51,7 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
     2. No Truncation: Entire sample must fit, or it starts a new pack.
     3. No Auto-EOS: Assumes input already has EOS if needed.
     4. Segment Types: Tracks specific segment types (Anchor=0, Pos=1, Neg=2...).
-    5. Segment IDs: Indicates which sample each token belongs to (all tokens in a segment have the same segment_id).
+    5. Segment IDs: Encodes sample_id * num_slots + triplet_type, so different triplet_types have different segment_ids.
     6. Attention Mask: 1D mask indicating valid (non-padding) positions, shape [seq_len].
     """
 
@@ -65,6 +62,7 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
         pad_token_id: int = 0,
         include_segment_ids: bool = True,
         max_samples: int = 128,
+        num_negatives: int = 1,
     ):
         """
         Initialize ContrastiveMaxSampleGreedyPacker.
@@ -75,6 +73,7 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             pad_token_id: Padding token ID.
             include_segment_ids: Whether to track segment IDs.
             max_samples: Maximum number of samples allowed per packed sequence.
+            num_negatives: Number of negative samples per anchor-positive pair.
         """
         super().__init__(
             seq_length=seq_length,
@@ -83,12 +82,15 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             include_segment_ids=include_segment_ids,
         )
         self.max_samples = max_samples
+        self.num_negatives = num_negatives
+        # Calculate num_slots: Anchor(1) + Positive(1) + Negatives(N)
+        self.num_slots = 2 + num_negatives
 
         # Additional buffers specific to this packer
         self._triplet_type_buffer: list[int] = []
         self._sample_index_buffer: list[
             int
-        ] = []  # Used to generate segment_ids (indicates which sample each token belongs to)
+        ] = []  # Used to generate segment_ids (sample index for each token)
 
     def _create_independent_pack(
         self, tokens: list[int], triplet_types: list[int], source_id: str | None = None
@@ -101,7 +103,7 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
         # Use temporary buffers
         temp_buffer = list(tokens)
         temp_triplet_type_buffer = list(triplet_types)
-        temp_sample_index_buffer = [0] * len(tokens)  # Single sample, segment_id = 0
+        temp_sample_index = 0  # Single sample, sample_index = 0
         temp_source_ids = [source_id] if source_id else []
 
         # Create pack using the same logic as flush_final but with temporary data
@@ -113,31 +115,41 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             temp_buffer + [self.pad_token_id] * pad_len, dtype=np.int32
         )
 
-        # 2. Segment Type: Pad with -1
-        triplet_type = np.array(
-            temp_triplet_type_buffer + [-1] * pad_len, dtype=np.int32
-        )
+        # 2. Segment IDs: Encode as sample_id * num_slots + triplet_type
+        # Different triplet_types have different segment_ids
+        # segment_ids[i] = sample_index * num_slots + triplet_type[i]
+        # Padding uses -1 (following MaskInfo convention)
+        segment_ids_list = []
+        for i, t_type in enumerate(temp_triplet_type_buffer):
+            if t_type >= 0:  # Valid triplet type
+                segment_ids_list.append(temp_sample_index * self.num_slots + t_type)
+            else:  # Invalid type (shouldn't happen in normal flow, but be safe)
+                segment_ids_list.append(-1)
+        segment_ids = np.array(segment_ids_list + [-1] * pad_len, dtype=np.int32)
 
-        # 3. Segment IDs: All tokens belong to segment 0, padding uses -1
-        # Following MaskInfo convention: -1 for padding tokens
-        segment_ids = np.array(
-            temp_sample_index_buffer + [-1] * pad_len, dtype=np.int32
-        )
-
-        # 4. Attention Mask
+        # 3. Attention Mask
         attention_mask = np.array([1] * current_len + [0] * pad_len, dtype=np.int32)
 
-        # 5. Position IDs: Start from 0 for the single sample
+        # 4. Position IDs: Each unique segment_id resets position_id starting from 0
+        # For each unique segment_id (which now encodes both sample and triplet_type),
+        # position_ids start from 0 and increment
+        # Padding positions have position_id = 0
         position_ids = np.zeros(self.seq_length, dtype=np.int32)
-        for i in range(current_len):
-            position_ids[i] = i
+        if segment_ids_list:
+            # Track position counter for each segment_id
+            segment_positions: dict[int, int] = {}
+            for i, seg_id in enumerate(segment_ids_list):
+                if seg_id >= 0:  # Valid segment_id
+                    if seg_id not in segment_positions:
+                        segment_positions[seg_id] = 0
+                    position_ids[i] = segment_positions[seg_id]
+                    segment_positions[seg_id] += 1
 
         # Create Result
         result = ContrastivePackedSequence(
             input_ids=input_ids,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
-            triplet_type=triplet_type,
             position_ids=position_ids,
             source_ids=temp_source_ids.copy() if temp_source_ids else None,
             num_segments=1,
@@ -209,8 +221,8 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
         self._triplet_type_buffer.extend(triplet_types)
 
         # Track sample index for segment_ids generation
-        # All tokens in this segment (anchor, positive, negatives) belong to the same sample
-        # segment_ids indicates which sample each token belongs to
+        # segment_ids will be computed as: sample_index * num_slots + triplet_type
+        # Different triplet_types will have different segment_ids
         self._sample_index_buffer.extend([self._current_segment] * sample_tokens_len)
 
         if source_id:
@@ -246,46 +258,51 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
             self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32
         )
 
-        # 2. Segment Type: Pad with -1
-        triplet_type = np.array(
-            self._triplet_type_buffer + [-1] * pad_len, dtype=np.int32
-        )
-
-        # 3. Segment IDs: Indicates which sample each token belongs to
-        # All tokens in a segment (anchor, positive, negatives) have the same segment_id
-        # Pad with -1 to indicate padding positions (following MaskInfo convention)
+        # 2. Segment IDs: Encode as sample_id * num_slots + triplet_type
+        # Different triplet_types have different segment_ids
+        # segment_ids[i] = sample_index[i] * num_slots + triplet_type[i]
+        # Padding uses -1 (following MaskInfo convention)
         # According to MaskInfo.from_segments documentation:
         # https://github.com/erfanzar/ejkernel/blob/d0c6af1ee534aa4dddce8abaeb04a661b602cf3b/ejkernel/types/mask.py#L677
         #   - Non-negative integers: segment membership (0, 1, 2, ...)
         #   - -1: padding tokens
-        segment_ids = np.array(
-            self._sample_index_buffer + [-1] * pad_len, dtype=np.int32
-        )
+        segment_ids_list = []
+        for i, (sample_idx, t_type) in enumerate(
+            zip(self._sample_index_buffer, self._triplet_type_buffer)
+        ):
+            if t_type >= 0:  # Valid triplet type
+                segment_ids_list.append(sample_idx * self.num_slots + t_type)
+            else:  # Invalid type (shouldn't happen in normal flow, but be safe)
+                segment_ids_list.append(-1)
+        segment_ids = np.array(segment_ids_list + [-1] * pad_len, dtype=np.int32)
 
-        # 4. Attention Mask: 1D mask indicating valid (non-padding) positions
+        # 3. Attention Mask: 1D mask indicating valid (non-padding) positions
         # 1 for valid tokens, 0 for padding
         # Shape: [seq_len]
         attention_mask = np.array([1] * current_len + [0] * pad_len, dtype=np.int32)
 
-        # 5. Position IDs: Each sample resets position_id starting from 0
-        # For each unique segment_id, position_ids start from 0 and increment
+        # 5. Position IDs: Each unique segment_id resets position_id starting from 0
+        # For each unique segment_id (which now encodes both sample and triplet_type),
+        # position_ids start from 0 and increment
         # Padding positions have position_id = 0
         position_ids = np.zeros(self.seq_length, dtype=np.int32)
-        if self._sample_index_buffer:
+        if (
+            segment_ids_list
+        ):  # Use computed segment_ids_list instead of sample_index_buffer
             # Track position counter for each segment_id
             segment_positions: dict[int, int] = {}
-            for i, seg_id in enumerate(self._sample_index_buffer):
-                if seg_id not in segment_positions:
-                    segment_positions[seg_id] = 0
-                position_ids[i] = segment_positions[seg_id]
-                segment_positions[seg_id] += 1
+            for i, seg_id in enumerate(segment_ids_list):
+                if seg_id >= 0:  # Valid segment_id
+                    if seg_id not in segment_positions:
+                        segment_positions[seg_id] = 0
+                    position_ids[i] = segment_positions[seg_id]
+                    segment_positions[seg_id] += 1
 
         # Create Result
         result = ContrastivePackedSequence(
             input_ids=input_ids,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
-            triplet_type=triplet_type,
             position_ids=position_ids,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=self._current_segment,
@@ -305,7 +322,8 @@ class ContrastiveMaxSampleGreedyPacker(GreedyPacker):
 class ContrastivePackedShardedSource(PackedShardedSource):
     """
     ShardedSource that uses ContrastiveMaxSampleGreedyPacker.
-    It assumes the input stream already contains 'input_ids' and 'triplet_type'.
+    It assumes the input stream already contains 'input_ids' and 'triplet_type' (internal use only).
+    The triplet_type is used to compute segment_ids, but is not included in the final output.
     """
 
     def __init__(
@@ -322,6 +340,7 @@ class ContrastivePackedShardedSource(PackedShardedSource):
         shuffle_buffer_factor: int = 10,
         seed: int | None = None,
         max_samples: int = 128,
+        num_negatives: int = 1,
     ):
         """
         Initialize ContrastivePackedShardedSource with full parameter parity.
@@ -339,6 +358,7 @@ class ContrastivePackedShardedSource(PackedShardedSource):
             shuffle_buffer_factor: Buffer size multiplier for shuffling.
             seed: Random seed.
             max_samples: Maximum number of samples allowed per packed sequence.
+            num_negatives: Number of negative samples per anchor-positive pair.
         """
         # Initialize base with compatible params
         super().__init__(
@@ -355,6 +375,7 @@ class ContrastivePackedShardedSource(PackedShardedSource):
             seed=seed,
         )
         self._max_samples = max_samples
+        self._num_negatives = num_negatives
 
     def _create_packer(self):
         """Create the custom ContrastiveMaxSampleGreedyPacker."""
@@ -368,6 +389,7 @@ class ContrastivePackedShardedSource(PackedShardedSource):
                 pad_token_id=self._pad_token_id,
                 include_segment_ids=self._include_segment_ids,
                 max_samples=sample_limit,
+                num_negatives=self._num_negatives,
             )
         elif self._strategy == "pool":
             return PoolPacker(
@@ -388,7 +410,8 @@ class ContrastivePackedShardedSource(PackedShardedSource):
 
     def open_shard(self, shard_name: str) -> Iterator[dict]:
         """
-        Overridden open_shard to handle 'triplet_type' extraction.
+        Overridden open_shard to handle 'triplet_type' extraction (internal use only).
+        triplet_type is used to compute segment_ids but is not included in the final output.
         """
         import random  # Ensure local import availability
 

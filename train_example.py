@@ -264,14 +264,17 @@ def train_model(
             batch_size=num_devices * batch_size,
             seq_length=seq_length,
             max_samples=max_samples,
-            # max_sample_length=max_sample_length,
+            max_sample_length=max_sample_length,
             shuffle=True,
             seed=42,
+            num_negatives=num_negatives,  # Pass num_negatives to dataset source
         )
         print("✓ 数据 source 创建成功")
         print(f"  - data_files: {data_files}")
         print(f"  - seq_length: {seq_length}")
         print(f"  - max_samples: {max_samples}")
+        print(f"  - max_sample_length: {max_sample_length}")
+        print(f"  - num_negatives: {num_negatives}")
     except Exception as e:
         print(f"✗ 数据 source 创建失败: {e}")
         import traceback

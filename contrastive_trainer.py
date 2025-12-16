@@ -79,7 +79,7 @@ def train_step(
 
     Args:
       state: Current model state
-      batch: Batch containing input_ids, attention_mask, segment_ids, triplet_type
+      batch: Batch containing input_ids, attention_mask, segment_ids
       learning_rate_fn: Learning rate function
       max_samples: Maximum number of samples per packed sequence
       num_negatives: Number of negative samples per anchor-positive pair
@@ -176,7 +176,7 @@ def eval_step(
 
     Args:
       state: Current model state
-      batch: Batch containing input_ids, attention_mask, segment_ids, triplet_type
+      batch: Batch containing input_ids, attention_mask, segment_ids
       max_samples: Maximum number of samples per packed sequence
       num_negatives: Number of negative samples per anchor-positive pair
       temperature: Temperature parameter for InfoNCE loss
@@ -246,7 +246,7 @@ class ContrastiveTrainer(Trainer):
     Key Features:
     - Supports triplet-based contrastive learning with InfoNCE loss
     - Integrates with dataset_loader.py for data processing
-    - Handles packed sequences with segment_ids and triplet_type
+    - Handles packed sequences with segment_ids (encoding sample_id * num_slots + triplet_type)
     - Automatic embedding extraction and loss computation
     - Full support for distributed training with JAX
 
@@ -254,8 +254,7 @@ class ContrastiveTrainer(Trainer):
     The trainer expects batches containing:
     - input_ids: Token IDs [batch_size, seq_length]
     - attention_mask: Attention mask [batch_size, seq_length]
-    - segment_ids: Segment IDs for sample boundaries [batch_size, seq_length]
-    - triplet_type: Type markers (0=anchor, 1=positive, 2+=negative) [batch_size, seq_length]
+    - segment_ids: Segment IDs encoding sample_id * num_slots + triplet_type [batch_size, seq_length]
 
     Model Requirements:
     The model should support the following forward signature:
@@ -265,7 +264,6 @@ class ContrastiveTrainer(Trainer):
       attention_mask,
       segment_ids,
       position_ids,
-      triplet_type,
       max_samples=64,
       num_negatives=1,
       output_hidden_states=False
@@ -549,8 +547,7 @@ class ContrastiveTrainer(Trainer):
         The data from ShardedDataSource is already packed and contains:
         - input_ids: Token IDs
         - attention_mask: Attention mask
-        - segment_ids: Segment IDs for sample boundaries
-        - triplet_type: Type markers (0=anchor, 1=positive, 2+=negative)
+        - segment_ids: Segment IDs encoding sample_id * num_slots + triplet_type
         - position_ids: Position IDs (optional)
 
         Args:
@@ -597,7 +594,6 @@ class ContrastiveTrainer(Trainer):
                     "input_ids",
                     "attention_mask",
                     "segment_ids",
-                    "triplet_type",
                     "position_ids",
                 ]:
                     # For sequence fields, pad or truncate to max_sequence_length

@@ -159,7 +159,6 @@ class Qwen3EmbeddingRunner:
         attention_mask,
         segment_ids,
         position_ids,
-        triplet_type,
         max_samples,
         num_negatives,
         output_hidden_states,
@@ -172,7 +171,6 @@ class Qwen3EmbeddingRunner:
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             position_ids=position_ids,
-            triplet_type=triplet_type,
             max_samples=max_samples,
             num_negatives=num_negatives,
             output_hidden_states=output_hidden_states,
@@ -189,7 +187,6 @@ class Qwen3EmbeddingRunner:
         attention_mask=None,
         segment_ids=None,
         position_ids=None,
-        triplet_type=None,
         max_samples=64,
         num_negatives=1,
         output_hidden_states=False,
@@ -203,7 +200,6 @@ class Qwen3EmbeddingRunner:
             attention_mask,
             segment_ids,
             position_ids,
-            triplet_type,
             max_samples,
             num_negatives,
             output_hidden_states,
@@ -216,7 +212,6 @@ class Qwen3EmbeddingRunner:
         attention_mask,
         segment_ids,
         position_ids,
-        triplet_type,
         max_samples=64,
         num_negatives=1,
         temperature=0.07,
@@ -233,7 +228,6 @@ class Qwen3EmbeddingRunner:
             attention_mask,
             segment_ids,
             position_ids,
-            triplet_type,
             max_samples,
             num_negatives,
             output_hidden_states=False,
@@ -282,7 +276,6 @@ class Qwen3EmbeddingRunner:
         attention_mask,
         segment_ids,
         position_ids,
-        triplet_type,
         **kwargs,
     ):
         """
@@ -296,7 +289,6 @@ class Qwen3EmbeddingRunner:
                 attention_mask,
                 segment_ids,
                 position_ids,
-                triplet_type,
                 **kwargs,
             )
 
@@ -754,6 +746,7 @@ def test_infonce_loss_computation(
         # Extract sample info (use 1D arrays for extraction)
         sample_info = extract_sample_info_from_segment_ids(
             segment_ids=segment_ids,
+            num_slots=3,  # 2 + 1 (num_negatives)
             attention_mask=attention_mask,
         )
 
@@ -765,13 +758,12 @@ def test_infonce_loss_computation(
         # Forward pass + Loss computation (using Runner's compute_loss)
         print("\n执行前向传播 + Loss 计算（SPMD 多卡并行）...")
         # When attention_mask is provided, we must provide
-        # segment_ids, triplet_type, and position_ids with matching shapes
+        # segment_ids and position_ids with matching shapes
         loss, metrics, projected_embs = runner.compute_loss(
             input_ids=input_ids,  # [1, seq_len]
             attention_mask=attention_mask,  # [1, seq_len]
             segment_ids=segment_ids,  # [1, seq_len]
             position_ids=position_ids,  # [1, seq_len] - required when attention_mask is provided
-            triplet_type=triplet_type,  # [1, seq_len]
             max_samples=64,  # Should match the max_samples used in dataset pipeline
             num_negatives=1,  # Number of negative samples per triplet
             temperature=0.07,
@@ -802,7 +794,6 @@ def test_infonce_loss_computation(
                 attention_mask=attention_mask,
                 segment_ids=segment_ids,
                 position_ids=position_ids,
-                triplet_type=triplet_type,
                 max_samples=64,
                 num_negatives=1,
                 temperature=temp,
@@ -961,6 +952,7 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
         # Extract sample info
         sample_info = extract_sample_info_from_segment_ids(
             segment_ids=segment_ids,
+            num_slots=3,  # 2 + 1 (num_negatives)
             attention_mask=attention_mask,
         )
 
@@ -978,7 +970,6 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
             attention_mask=attention_mask,  # [1, seq_len]
             segment_ids=segment_ids,  # [1, seq_len]
             position_ids=position_ids,  # [1, seq_len]
-            triplet_type=triplet_type,  # [1, seq_len]
             max_samples=64,  # Should match the max_samples used in dataset pipeline
             num_negatives=num_negatives,  # Number of negative samples per triplet
             temperature=0.07,
@@ -1009,12 +1000,15 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
                 continue
 
             # Rebuild data with specified number of negatives
+            # Note: segment_ids now encodes sample_id * num_slots + triplet_type
+            # We need to compute segment_ids based on sample index and triplet_type
             all_input_ids_neg = []
             all_triplet_type_neg = []
             all_segment_ids_neg = []
             all_attention_mask_neg = []
 
-            current_segment_id_neg = 0
+            num_slots = 2 + num_neg  # Anchor(1) + Positive(1) + Negatives(N)
+            current_sample_idx = 0
             for triplet in test_triplets:
                 anchor_encoded = tokenizer(
                     triplet["anchor"],
@@ -1051,9 +1045,11 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
                     sample_input_ids_neg.extend(neg_ids)
                     sample_triplet_type_neg.extend([2 + neg_idx] * len(neg_ids))
 
-                sample_segment_ids_neg = [current_segment_id_neg] * len(
-                    sample_input_ids_neg
-                )
+                # Compute segment_ids: sample_id * num_slots + triplet_type
+                sample_segment_ids_neg = [
+                    current_sample_idx * num_slots + t_type
+                    for t_type in sample_triplet_type_neg
+                ]
                 sample_attention_mask_neg = [1] * len(sample_input_ids_neg)
 
                 all_input_ids_neg.extend(sample_input_ids_neg)
@@ -1061,10 +1057,9 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
                 all_segment_ids_neg.extend(sample_segment_ids_neg)
                 all_attention_mask_neg.extend(sample_attention_mask_neg)
 
-                current_segment_id_neg += 1
+                current_sample_idx += 1
 
             input_ids_neg = jnp.array(all_input_ids_neg)[jnp.newaxis, :]
-            triplet_type_neg = jnp.array(all_triplet_type_neg)[jnp.newaxis, :]
             segment_ids_neg = jnp.array(all_segment_ids_neg)[jnp.newaxis, :]
             attention_mask_neg = jnp.array(all_attention_mask_neg)[jnp.newaxis, :]
             seq_len_neg = input_ids_neg.shape[1]
@@ -1076,7 +1071,6 @@ def test_multiple_negatives(runner: Qwen3EmbeddingRunner, tokenizer: AutoTokeniz
                 attention_mask=attention_mask_neg,
                 segment_ids=segment_ids_neg,
                 position_ids=position_ids_neg,
-                triplet_type=triplet_type_neg,
                 max_samples=64,
                 num_negatives=num_neg,
                 temperature=0.07,

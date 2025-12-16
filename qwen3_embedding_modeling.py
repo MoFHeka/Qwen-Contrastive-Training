@@ -259,7 +259,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         position_ids: chex.Array | None = None,
-        triplet_type: chex.Array | None = None,
         max_samples: int = 1,
         num_negatives: int = 1,
         output_hidden_states: bool = False,
@@ -271,8 +270,9 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         Args:
           input_ids: Token IDs [batch_size, seq_len] or [seq_len]
           attention_mask: Attention mask [batch_size, seq_len] or [seq_len]
-          segment_ids: Segment IDs array [seq_len] for extracting sample boundaries
-          triplet_type: Segment type array [seq_len] where 0=anchor, 1=positive, 2=negative, -1=special_token
+          segment_ids: Segment IDs array [seq_len] encoding sample_id * num_slots + triplet_type.
+                      If provided, extracts embeddings for contrastive learning.
+          position_ids: Position IDs array [seq_len]
           max_samples: Maximum number of samples per packed sequence. Must be a static value for JIT compilation.
                       Should match the max_samples value used in create_dataset_pipeline. Default: 64.
           num_negatives: Number of negative samples per sample. Default: 1.
@@ -280,10 +280,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
           **kwargs: Additional arguments for base model
 
         Returns:
-          If triplet_type is provided:
-            Tuple of (projected_embs, slot_mask) where:
-              - projected_embs: [batch_size, max_samples, num_slots, embedding_dim]
-              - slot_mask: [batch_size, max_samples, num_slots]
+          If segment_ids is provided:
+            Projected embeddings [batch_size, max_samples, num_slots, embedding_dim] or ModelOutput with hidden_states
           Otherwise:
             Projected embeddings [batch_size, seq_len, embedding_dim] or ModelOutput with hidden_states
         """
@@ -294,10 +292,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         if input_ids.ndim == 1:
             if segment_ids is not None:
                 chex.assert_rank(segment_ids, {1})
-            else:
-                segment_ids = jnp.zeros_like(input_ids)
-            if triplet_type is not None:
-                chex.assert_rank(triplet_type, {1})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {1})
             if position_ids is not None:
@@ -305,10 +299,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         elif input_ids.ndim == 2:
             if segment_ids is not None:
                 chex.assert_rank(segment_ids, {2})
-            else:
-                segment_ids = jnp.zeros_like(input_ids)
-            if triplet_type is not None:
-                chex.assert_rank(triplet_type, {2})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {2})
             if position_ids is not None:
@@ -329,6 +319,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             mask_info = MaskInfo.from_segments(segment_ids)
         elif attention_mask is not None:
             mask_info = MaskInfo.from_attention_mask(attention_mask)
+        else:
+            mask_info = MaskInfo.from_segments(jnp.zeros_like(input_ids))
 
         # Forward through base model
         base_outputs = self.base_model(
@@ -349,18 +341,24 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             last_hidden_state = base_outputs
 
         slot_mask = None
-        if triplet_type is not None:
-            # Extract and project embeddings for triplet-based training
+        # Check if segment_ids encodes contrastive learning structure (packed sequences)
+        # segment_ids now directly encodes sample_id * num_slots + triplet_type
+        # In eager inference mode (no pack), segment_ids is None or contains no valid pack information
+        # In training mode or padding inference mode (with pack), segment_ids contains meaningful values (>= 0)
+        has_packed_or_padding_sequences = segment_ids is not None
+
+        if has_packed_or_padding_sequences:
+            # Training mode: Extract and project embeddings for triplet-based training
             # max_samples is a static parameter for JIT compilation
             # Should match the max_samples value used in create_dataset_pipeline
 
             # 1. 提取 (得到大宽表)
             # combined: [B, Samples, 2+Num_Negatives, H]
             # mask:     [B, Samples, 2+Num_Negatives]
+            # segment_ids directly encodes sample_id * num_slots + triplet_type
             combined_embs, slot_mask = self._extract_last_token_embeddings(
                 hidden_states=last_hidden_state,
                 segment_ids=segment_ids,
-                triplet_type=triplet_type,
                 q_attention_mask=mask_info.q_attention_mask,
                 max_samples=max_samples,
                 num_negatives=num_negatives,
@@ -371,8 +369,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             # 3. 应用 slot_mask, 清除bias影响
             projected_embs = projected_embs * slot_mask[..., None]
         else:
-            # Standard forward pass without triplet extraction
-            # Only take the last token hidden state
+            # Inference mode: No pack, directly take the last token hidden state
             projected_embs = self.projection(last_hidden_state[:, -1, :])
 
         if output_hidden_states:
@@ -409,8 +406,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             **batch: Keyword arguments representing the input batch:
                 - input_ids: Token IDs [batch_size, seq_len]
                 - attention_mask: Attention mask [batch_size, seq_len]
-                - segment_ids: Segment IDs for sample boundaries [batch_size, seq_len]
-                - triplet_type: Type markers (0=anchor, 1=positive, 2+=negative) [batch_size, seq_len]
+                - segment_ids: Segment IDs encoding sample_id * num_slots + triplet_type [batch_size, seq_len]
                 - position_ids: Position IDs [batch_size, seq_len] (optional, will be generated if not provided)
 
         Returns:
@@ -419,7 +415,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
                 - LossMetrics object containing the computed loss and metrics
 
         Raises:
-            ValueError: If required batch fields (input_ids, attention_mask, segment_ids, triplet_type) are missing.
+            ValueError: If required batch fields (input_ids, attention_mask, segment_ids) are missing.
         """
         # Extract contrastive learning parameters from loss_kwargs or use defaults
         loss_kwargs = loss_kwargs or {}
@@ -435,13 +431,12 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
         attention_mask = batch.get("attention_mask")
         segment_ids = batch.get("segment_ids")
-        triplet_type = batch.get("triplet_type")
         position_ids = batch.get("position_ids")
 
         # Validate required fields for contrastive learning
-        if attention_mask is None or segment_ids is None or triplet_type is None:
+        if attention_mask is None or segment_ids is None:
             raise ValueError(
-                "attention_mask, segment_ids, and triplet_type are required for contrastive learning"
+                "attention_mask and segment_ids are required for contrastive learning"
             )
 
         # Generate position_ids if not provided
@@ -457,7 +452,6 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             position_ids=position_ids,
-            triplet_type=triplet_type,
             max_samples=max_samples,
             num_negatives=num_negatives,
             output_hidden_states=True,
@@ -517,8 +511,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
     def _extract_last_token_embeddings(
         self,
         hidden_states: jax.Array,  # [B, Seq, H]
-        segment_ids: jax.Array,  # [B, Seq]
-        triplet_type: jax.Array,  # [B, Seq] (0=A, 1=P, 2=N1, 3=N2...)
+        segment_ids: jax.Array,  # [B, Seq] - Encodes sample_id * num_slots + triplet_type
         q_attention_mask: jax.Array,  # [B, Seq]
         max_samples: int = 64,
         num_negatives: int = 1,  # 负样本数量
@@ -532,49 +525,31 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         hs_ndim = hidden_states.ndim
         if hs_ndim == 2:
             chex.assert_rank(segment_ids, 1)
-            chex.assert_rank(triplet_type, 1)
             chex.assert_rank(q_attention_mask, 1)
         elif hs_ndim == 3:
             chex.assert_rank(segment_ids, 2)
-            chex.assert_rank(triplet_type, 2)
             chex.assert_rank(q_attention_mask, 2)
         else:
             raise ValueError(f"Unexpected hidden_states dimension: {hs_ndim}")
 
         # --- 核心逻辑 (vmap 自动处理 Batch) ---
-        def _process_single_batch(h_states, s_ids, s_types, mask):
+        def _process_single_batch(h_states, s_ids, mask):
             seq_len = s_ids.shape[0]
 
-            # # A. 确定有效 Token
-            # # 主要依赖 q_attention_mask 来过滤 padding (mask=0)
-            # # 同时过滤非法 Type (<0)
-            # is_valid_token = (mask > 0) & (s_types >= 0)
-            #
-            # # B. 边界检查
-            # # 确保 Sample ID 和 Type ID 在预设范围内
-            # # Padding positions use segment_id = max(actual_segment_ids) + 1,
-            # # which will be >= max_samples in most cases, but we rely on q_attention_mask for filtering
-            # in_bounds = (s_ids < max_samples) & (s_types < num_slots)
-            #
-            # total_valid_mask = is_valid_token & in_bounds
-
-            # A + B. 快速路径，只用 q_attention_mask 来过滤 padding
+            # A. 使用 q_attention_mask 来过滤 padding
             total_valid_mask = mask
 
-            # C. 计算 Scatter Index (扁平化索引)
-            # 唯一 ID = sample_id * num_slots + type_id
-            # 例如:
-            # Sample 0 的 Anchor=[0, 0, ..., 0], Pos=[1, 1, ..., 1], Neg1=[2, 2, ..., 2], ...
-            # Sample 1 的 Anchor=[num_slots, num_slots, ..., num_slots], Pos=[num_slots+1, num_slots+1, ..., num_slots+1], ...
-            # ...
-            scatter_indices = s_ids * num_slots + s_types
+            # B. segment_ids 现在直接编码为 sample_id * num_slots + triplet_type
+            # 可以直接使用 segment_ids 作为 scatter_indices
+            scatter_indices = s_ids
 
-            # 边界检查：确保 scatter_indices 在有效范围内
+            # C. 边界检查：确保 scatter_indices 在有效范围内
             num_slots_total = max_samples * num_slots
             in_bounds = scatter_indices < num_slots_total
 
             # 综合有效性检查：attention_mask 和边界检查
-            total_valid_mask = mask & in_bounds
+            # 同时过滤掉 padding 位置的 segment_id = -1
+            total_valid_mask = mask & in_bounds & (scatter_indices >= 0)
 
             # 将无效位置设为越界值
             out_of_bound_idx = num_slots_total
@@ -623,12 +598,10 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             )
 
         if hs_ndim == 2:
-            return _process_single_batch(
-                hidden_states, segment_ids, triplet_type, q_attention_mask
-            )
+            return _process_single_batch(hidden_states, segment_ids, q_attention_mask)
         elif hs_ndim == 3:
             return jax.vmap(_process_single_batch)(
-                hidden_states, segment_ids, triplet_type, q_attention_mask
+                hidden_states, segment_ids, q_attention_mask
             )
         else:
             raise ValueError(f"Unexpected hidden_states dimension: {hs_ndim}")
