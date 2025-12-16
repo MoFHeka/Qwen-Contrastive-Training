@@ -260,7 +260,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         segment_ids: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         triplet_type: chex.Array | None = None,
-        max_samples: int = 64,
+        max_samples: int = 1,
         num_negatives: int = 1,
         output_hidden_states: bool = False,
         **kwargs,
@@ -294,31 +294,31 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         if input_ids.ndim == 1:
             if segment_ids is not None:
                 chex.assert_rank(segment_ids, {1})
+            else:
+                segment_ids = jnp.zeros_like(input_ids)
             if triplet_type is not None:
                 chex.assert_rank(triplet_type, {1})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {1})
+            else:
+                attention_mask = jnp.ones_like(input_ids)
             if position_ids is not None:
                 chex.assert_rank(position_ids, {1})
         elif input_ids.ndim == 2:
             if segment_ids is not None:
                 chex.assert_rank(segment_ids, {2})
+            else:
+                segment_ids = jnp.zeros_like(input_ids)
             if triplet_type is not None:
                 chex.assert_rank(triplet_type, {2})
             if attention_mask is not None:
                 chex.assert_rank(attention_mask, {2})
+            else:
+                attention_mask = jnp.ones_like(input_ids)
             if position_ids is not None:
                 chex.assert_rank(position_ids, {2})
         else:
             raise ValueError(f"Unexpected input_ids dimension: {input_ids.ndim}")
-
-        if attention_mask is not None:
-            assert segment_ids is not None
-            assert triplet_type is not None
-            assert position_ids is not None
-            assert position_ids.shape == segment_ids.shape
-            assert position_ids.shape == attention_mask.shape
-            assert position_ids.shape == triplet_type.shape
 
         # All computations within the same mesh for distributed training
         # EasyDeL models are designed for SPMD (jit + Mesh), not pmap
@@ -335,17 +335,17 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             attention_mask=None,
             mask_info=mask_info,
             position_ids=position_ids,
-            output_hidden_states=True,  # Always get hidden states for extraction
+            output_hidden_states=output_hidden_states,  # Always get hidden states for extraction
             **kwargs,
         )
 
         # Extract hidden states
         if hasattr(base_outputs, "last_hidden_state"):
-            hidden_states = base_outputs.last_hidden_state
+            last_hidden_state = base_outputs.last_hidden_state
         elif isinstance(base_outputs, tuple):
-            hidden_states = base_outputs[0]
+            last_hidden_state = base_outputs[0]
         else:
-            hidden_states = base_outputs
+            last_hidden_state = base_outputs
 
         slot_mask = None
         if triplet_type is not None:
@@ -357,7 +357,7 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             # combined: [B, Samples, 2+Num_Negatives, H]
             # mask:     [B, Samples, 2+Num_Negatives]
             combined_embs, slot_mask = self._extract_last_token_embeddings(
-                hidden_states=hidden_states,
+                hidden_states=last_hidden_state,
                 segment_ids=segment_ids,
                 triplet_type=triplet_type,
                 attention_mask=attention_mask,
@@ -369,11 +369,12 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
             projected_embs = self.projection(combined_embs)
         else:
             # Standard forward pass without triplet extraction
-            projected_embs = self.projection(hidden_states)
+            # Only take the last token hidden state
+            projected_embs = self.projection(last_hidden_state[:, -1, :])
 
         if output_hidden_states:
             return Qwen3EmbeddingModelOutput(
-                last_hidden_state=hidden_states,
+                last_hidden_state=last_hidden_state,
                 projected_hidden_state=projected_embs,
                 hidden_states=base_outputs.hidden_states,
                 packed_sample_slot_mask=slot_mask,
