@@ -26,7 +26,7 @@ from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import auto_remat, auto_pytree
 
 from qwen3_embedding_config import Qwen3EmbeddingConfig
-from loss import info_nce_loss
+from loss import info_nce_loss, normalize
 
 CUSTOM_MODEL_TYPE = "qwen3_embedding_with_projection"
 BASE_MODEL_TYPE = "qwen3"
@@ -322,6 +322,8 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         else:
             mask_info = MaskInfo.from_segments(jnp.zeros_like(input_ids))
 
+        q_attention_mask = mask_info.q_attention_mask
+
         # Forward through base model
         base_outputs = self.base_model(
             input_ids=input_ids,
@@ -354,23 +356,28 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
 
             # 1. 提取 (得到大宽表)
             # combined: [B, Samples, 2+Num_Negatives, H]
-            # mask:     [B, Samples, 2+Num_Negatives]
+            # slot_mask:     [B, Samples, 2+Num_Negatives]
             # segment_ids directly encodes sample_id * num_slots + triplet_type
             combined_embs, slot_mask = self._extract_last_token_embeddings(
                 hidden_states=last_hidden_state,
                 segment_ids=segment_ids,
-                q_attention_mask=mask_info.q_attention_mask,
+                q_attention_mask=q_attention_mask,
                 max_samples=max_samples,
                 num_negatives=num_negatives,
             )
 
-            # 2. 投影 (一次性投影所有向量，效率最高)
+            # 2. 归一化Qwen Embedding输出
+            combined_embs = normalize(combined_embs, mask=slot_mask[..., None])
+
+            # 3. 投影 (一次性投影所有向量，效率最高)
             projected_embs = self.projection(combined_embs)
-            # 3. 应用 slot_mask, 清除bias影响
-            projected_embs = projected_embs * slot_mask[..., None]
+            # 4. 归一化Projection输出
+            projected_embs = normalize(projected_embs, mask=slot_mask[..., None])
         else:
             # Inference mode: No pack, directly take the last token hidden state
-            projected_embs = self.projection(last_hidden_state[:, -1, :])
+            last_hidden_state = normalize(last_hidden_state[:, -1, :])
+            projected_embs = self.projection(last_hidden_state)
+            projected_embs = normalize(projected_embs)
 
         if output_hidden_states:
             return Qwen3EmbeddingModelOutput(
@@ -464,20 +471,18 @@ class Qwen3EmbeddingModel(EasyDeLBaseModule):
         # Split embeddings and masks
         # Slot structure: [Anchor(0), Positive(1), Negatives(2...)]
         anchor_emb = projected_embs[..., 0, :]  # [B, Samples, H]
-        anchor_mask = slot_mask[..., 0]  # [B, Samples]
+        # anchor_mask = slot_mask[..., 0]  # [B, Samples]
         positive_emb = projected_embs[..., 1, :]  # [B, Samples, H]
-        pos_mask = slot_mask[..., 1]  # [B, Samples]
+        # pos_mask = slot_mask[..., 1]  # [B, Samples]
         negatives_emb = projected_embs[..., 2:, :]  # [B, Samples, Num_Negatives, H]
-        negs_mask = slot_mask[..., 2:]  # [B, Samples, Num_Negatives]
+        # negs_mask = slot_mask[..., 2:]  # [B, Samples, Num_Negatives]
 
         # Compute InfoNCE loss and metrics
         loss, contrastive_metrics = info_nce_loss(
             anchor_emb=anchor_emb,
             positive_emb=positive_emb,
             negatives_emb=negatives_emb,
-            anchor_mask=anchor_mask,
-            pos_mask=pos_mask,
-            negs_mask=negs_mask,
+            sample_mask=slot_mask[..., 0],  # [B, Samples], mask padding samples
             temperature=temperature,
             return_metrics=compute_loss_metrics,
         )

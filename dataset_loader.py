@@ -308,8 +308,8 @@ def create_dataset_pipeline(
         load=LoadStageConfig(
             batch_size=batch_size,
             prefetch_enabled=True,
-            prefetch_workers=2,
-            prefetch_buffer_size=4,
+            prefetch_workers=16,
+            prefetch_buffer_size=32,
         ),
         pack=PackStageConfig(
             enabled=True,

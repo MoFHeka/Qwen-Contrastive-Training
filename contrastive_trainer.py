@@ -11,6 +11,9 @@ import os
 import json
 import typing as tp
 
+import multiprocessing
+from multiprocessing import Process, Queue
+
 import numpy as np
 
 import jax
@@ -233,6 +236,23 @@ def eval_step(
 
     metrics = loss_fn(state.graphstate)
     return metrics
+
+
+def _tensorboard_logger_worker(
+    arguments: TrainingArguments,
+    queue: Queue,
+    stop_event: multiprocessing.Event,
+):
+    while not stop_event.is_set():
+        try:
+            item = queue.get()
+            if item is None:
+                break
+            metrics, step = item
+            arguments._log_to_tensorboard(metrics, step)
+        except Exception as e:
+            logger.warning(f"Failed to log metrics to TensorBoard: {e}")
+            continue
 
 
 class ContrastiveTrainer(Trainer):
@@ -463,6 +483,38 @@ class ContrastiveTrainer(Trainer):
         # Store original train dataset for resume state handling
         self._original_train_dataset = dataset_train
 
+        # Replace log_metrics function to enable asynchronous logging flush
+        # Create a wrapper function that matches the expected signature
+        # log_metrics calls self._log_to_tensorboard(metrics, step, log_as)
+        # where self is the arguments object
+        self._tb_log_queue = Queue(maxsize=100)
+        self._tb_log_stop_event = multiprocessing.Event()
+
+        self._tb_log_process = Process(
+            target=_tensorboard_logger_worker,
+            args=(
+                arguments,
+                self._tb_log_queue,
+                self._tb_log_stop_event,
+            ),
+            daemon=True,
+            name="EasyDeL-TensorBoard-Logger",
+        )
+        self._tb_log_process.start()
+
+        def _log_to_tensorboard_wrapper(metrics, step, log_as=None):
+            if self._tb_log_queue is None:
+                arguments._log_to_tensorboard(metrics, step, log_as)
+                return
+            try:
+                self._tb_log_queue.put_nowait((metrics, step))
+            except multiprocessing.queues.Full:
+                logger.warning("TensorBoard log queue full, dropping metrics")
+            except Exception as e:
+                logger.warning(f"Failed to log metrics to TensorBoard: {e}")
+
+        arguments._log_to_tensorboard = _log_to_tensorboard_wrapper
+
         # Initialize base trainer
         super().__init__(
             arguments=arguments,
@@ -475,6 +527,18 @@ class ContrastiveTrainer(Trainer):
             processing_class=processing_class,
             **kwargs,
         )
+
+    def __del__(self):
+        """Cleanup async logging resources."""
+        if self._tb_log_process is not None:
+            self._tb_log_stop_event.set()
+            self._tb_log_process.join(timeout=5)
+            if self._tb_log_process.is_alive():
+                logger.warning(
+                    "TensorBoard logger process did not terminate gracefully"
+                )
+                self._tb_log_process.terminate()
+                self._tb_log_process.join()
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
